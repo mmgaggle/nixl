@@ -188,6 +188,14 @@ public:
     size_t
     getReqTrueLen(nixlBackendReqH *handle, int idx = 0) const;
 
+    // Logical block (sector) size in bytes of the bound block namespace, or 0
+    // when this engine is not block-bound (no shim / KV mode). Read-only
+    // accessor over the shim's spdk_kv_shim_sector_size(); lets a caller map a
+    // block byte offset to its LBA (offset / sectorSize). Does not touch the
+    // datapath or any transfer state.
+    uint32_t
+    blockSectorSize() const;
+
 private:
     // Ratified maximum NVMe-KV inline key length (bytes).
     static constexpr uint8_t kMaxKeyLen = 16;

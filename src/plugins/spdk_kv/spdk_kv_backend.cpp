@@ -657,3 +657,8 @@ nixlSpdkKvEngine::getReqTrueLen(nixlBackendReqH *handle, int idx) const {
     }
     return req_h->true_lens[idx];
 }
+
+uint32_t
+nixlSpdkKvEngine::blockSectorSize() const {
+    return shim_ ? spdk_kv_shim_sector_size(shim_) : 0;
+}

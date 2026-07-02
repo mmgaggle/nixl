@@ -29,14 +29,23 @@
  *   3. distinct-LBA addressing: writes DIFFERENT patterns to two disjoint LBA
  *      ranges and asserts each reads back ITS OWN pattern (so a datapath that
  *      ignored remote.addr and always hit one LBA would fail);
+ *   4. independent per-region LBA placement (intra-transfer scatter guard):
+ *      writes a LARGE multi-region buffer (8 MiB = 4 x 2 MiB regions) at LBA 0
+ *      in ONE WRITE where each 2 MiB region carries a DISTINCT region-keyed
+ *      marker, then reads each region back through a SEPARATE single-region op
+ *      at that region's OWN LBA (region k -> LBA k*(2 MiB / sector)) and asserts
+ *      each returns region k's marker. Because the large WRITE and the per-region
+ *      READs use INDEPENDENT addressing, a large-WRITE that scattered a 2 MiB
+ *      region to the wrong LBA is caught here -- unlike the same-SGL round-trip
+ *      above, which cannot see a symmetric (write==read) region permutation;
  * and exercises the block validation guards, each of which must be REJECTED with
  * the SPECIFIC expected status (not merely "some non-success"), never a partial
  * transfer:
- *   4. a length that is not a multiple of the sector size => INVALID_PARAM;
- *   5. a length past the region-bounded single-op bound (~64 MiB; a 68 MiB
+ *   5. a length that is not a multiple of the sector size => INVALID_PARAM;
+ *   6. a length past the region-bounded single-op bound (~64 MiB; a 68 MiB
  *      transfer) => INVALID_PARAM, NOT split;
- *   6. an LBA range past the namespace capacity => INVALID_PARAM;
- *   7. QUERY on BLK_SEG => NIXL_ERR_NOT_SUPPORTED (no per-LBA existence).
+ *   7. an LBA range past the namespace capacity => INVALID_PARAM;
+ *   8. QUERY on BLK_SEG => NIXL_ERR_NOT_SUPPORTED (no per-LBA existence).
  *
  * Sizes are multiples of 4096 bytes so the happy path is valid for either a
  * 512- or 4096-byte-sector namespace; the misalignment case (a length that is
@@ -355,6 +364,92 @@ main(int argc, char **argv) {
         }
         std::cout << "distinct-LBA addressing OK: LBA " << lba_a << " and LBA " << lba_b
                   << " each returned their own distinct pattern\n";
+    }
+
+    // --- Independent per-region LBA placement (intra-transfer scatter guard) ---
+    // Write a LARGE multi-region buffer (8 MiB = 4 x 2 MiB regions) at LBA 0 in
+    // ONE WRITE op, where EACH 2 MiB region carries a DISTINCT, region-keyed
+    // marker; then read each region back through a SEPARATE single-region (2 MiB)
+    // op at that region's OWN LBA (region k -> LBA k*(2 MiB / sector_size)) and
+    // assert it returns region k's marker. The large WRITE and the per-region
+    // READs use INDEPENDENT addressing (single-region per-op addressing is proven
+    // by the distinct-LBA test above), so a large WRITE that scattered a 2 MiB
+    // region to the wrong LBA makes some independent read return the wrong
+    // region's marker. This is strictly stronger than the same-SGL round-trip,
+    // which cannot see a symmetric (write==read) intra-transfer region permutation.
+    {
+        const size_t MiB = 1024 * 1024;
+        const size_t region = 2 * MiB;    // one region-bounded SGL segment
+        const size_t regions = 4;         // 8 MiB total = 4 regions
+        const size_t total = regions * region;
+
+        // Map a region's byte offset to its LBA via the namespace sector size.
+        const uint32_t sector = eng.blockSectorSize();
+        if (sector == 0 || (region % sector) != 0) {
+            std::cerr << "FAIL: bad block sector size " << sector
+                      << " for region-scatter test\n";
+            return 1;
+        }
+        const uint64_t lba_per_region = region / sector;
+
+        // Fill each 2 MiB region with a DISTINCT, region-identifying marker so a
+        // mis-placed region is detectable by content alone.
+        auto fillRegion = [](std::vector<uint8_t> &buf, size_t off, size_t len, size_t k) {
+            for (size_t i = 0; i < len; ++i) {
+                buf[off + i] = static_cast<uint8_t>(
+                    (0x11u * (k + 1)) ^ ((i * 2246822519u + k * 2654435761u) >> 15));
+            }
+        };
+        std::vector<uint8_t> big(total, 0);
+        for (size_t k = 0; k < regions; ++k) {
+            fillRegion(big, k * region, region, k);
+        }
+        // Extract the per-region markers and assert they are PAIRWISE DISTINCT --
+        // else a scattered region could alias another and slip past the compare.
+        std::vector<std::vector<uint8_t>> markers(regions);
+        for (size_t k = 0; k < regions; ++k) {
+            markers[k].assign(big.begin() + k * region, big.begin() + (k + 1) * region);
+        }
+        for (size_t a = 0; a < regions; ++a) {
+            for (size_t b = a + 1; b < regions; ++b) {
+                if (markers[a] == markers[b]) {
+                    std::cerr << "FAIL: region markers " << a << " and " << b
+                              << " are not distinct\n";
+                    return 1;
+                }
+            }
+        }
+
+        // ONE large WRITE of all 4 regions at LBA 0.
+        std::vector<uint8_t> wbig = big;
+        if (!blockOp(eng, init.localAgent, NIXL_WRITE, /*lba=*/0, wbig)) {
+            std::cerr << "FAIL: large multi-region WRITE at LBA 0 failed\n";
+            return 1;
+        }
+
+        // Read EACH region back INDEPENDENTLY via its own single-region op at that
+        // region's own LBA and assert it returns region k's marker. A large WRITE
+        // that scattered a region to the wrong LBA is caught here.
+        for (size_t k = 0; k < regions; ++k) {
+            std::vector<uint8_t> rk(region, 0);
+            const uint64_t lba = static_cast<uint64_t>(k) * lba_per_region;
+            if (!blockOp(eng, init.localAgent, NIXL_READ, lba, rk)) {
+                std::cerr << "FAIL: independent region READ failed (region " << k
+                          << ", LBA " << lba << ")\n";
+                return 1;
+            }
+            if (rk != markers[k]) {
+                std::cerr << "FAIL: region-scatter: independent read at LBA " << lba
+                          << " did not return region " << k << "'s marker "
+                          << "(a large WRITE that scattered a 2 MiB region to the wrong "
+                          << "LBA would hit this)\n";
+                return 1;
+            }
+        }
+        std::cout << "independent region-scatter OK: 8 MiB (4 x 2 MiB) WRITE at LBA 0, "
+                  << "each region read back independently at its own LBA (sector="
+                  << sector << ", " << lba_per_region
+                  << " LBAs/region) returned its own distinct marker\n";
     }
 
     // --- Validation guards (each must be REJECTED with the SPECIFIC status
