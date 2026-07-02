@@ -463,19 +463,19 @@ nixlSpdkKvEngine::computeBlockRange(const nixlMetaDesc &local_desc,
         return NIXL_ERR_INVALID_PARAM;
     }
 
-    // SINGLE-range slice: one op stays within a single 2 MiB DMA region so the
-    // region-aligned staging buffer never straddles two independently-mapped
-    // vfio-user regions. Larger ranges need the region-bounded SGL (a later
-    // slice) and are REJECTED here, never split.
-    if (len > SPDK_KV_SHIM_DMA_REGION) {
-        NIXL_ERROR << "SPDK: block length " << len << " exceeds the single-range bound "
-                   << SPDK_KV_SHIM_DMA_REGION
-                   << " bytes (multi-region block SGL not yet supported)";
+    // NO striping: a single op carries up to the block single-op bound (~64 MiB)
+    // as one data-block descriptor per 2 MiB DMA region via the region-bounded
+    // SGL (mirrors the KV large-value bound spdk_kv_shim_max_value_len_op). A
+    // range past the bound is REJECTED here, before staging any DMA, never split.
+    const uint32_t max_op = spdk_kv_shim_max_block_len_op(shim_);
+    if (len > max_op) {
+        NIXL_ERROR << "SPDK: block length " << len << " exceeds the single-op bound "
+                   << max_op << " bytes; rejecting (no striping)";
         return NIXL_ERR_INVALID_PARAM;
     }
 
     const uint64_t lba = static_cast<uint64_t>(remote_desc.addr);
-    const uint64_t nlba = static_cast<uint64_t>(len) / sector; // <= REGION/sector, fits uint32
+    const uint64_t nlba = static_cast<uint64_t>(len) / sector; // <= MAX_VALUE_LEN/sector, fits uint32
     const uint64_t capacity = spdk_kv_shim_num_sectors(shim_);
 
     // Capacity: reject an LBA at/after the end, or a range running past it.
@@ -521,10 +521,11 @@ nixlSpdkKvEngine::postXferBlock(const nixl_xfer_op_t &operation,
         const size_t data_len = local_desc.len;
 
         // Stage through a region-aligned SPDK DMA buffer (same staging model as
-        // KV): the 2 MiB alignment keeps a single-range op inside one vfio-user
-        // region. WRITE copies host DRAM -> DMA then writes; READ reads into DMA
-        // then copies -> host DRAM. NO value auto-sizing (block moves exactly len
-        // bytes).
+        // KV): 2 MiB alignment makes each 2 MiB span its own region-bounded SGL
+        // data-block descriptor, so no descriptor straddles two independently-
+        // mapped vfio-user regions (up to the ~64 MiB single-op bound). WRITE
+        // copies host DRAM -> DMA then writes; READ reads into DMA then copies ->
+        // host DRAM. NO value auto-sizing (block moves exactly len bytes).
         void *dma = spdk_kv_shim_dma_alloc_aligned(data_len, SPDK_KV_SHIM_DMA_REGION);
         if (!dma) {
             NIXL_ERROR << "SPDK: block DMA buffer alloc failed (" << data_len << " bytes)";

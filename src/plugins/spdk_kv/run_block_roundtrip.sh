@@ -5,8 +5,10 @@
 # Brings up an SPDK nvmf target with an NVM (block) namespace backed by a
 # malloc bdev over VFIOUSER, then runs the SPDK direct-engine BLOCK round-trip
 # test against it. The test writes DRAM patterns to LBA ranges and reads them
-# back byte-exact (single-range, 4 KiB..2 MiB), and checks that misaligned,
-# over-single-range, and out-of-capacity ranges are cleanly rejected.
+# back byte-exact across 4 KiB..~60 MiB (large ranges ride the region-bounded
+# SGL, one data-block descriptor per 2 MiB region), and checks that misaligned,
+# over-single-op-bound (68 MiB), and out-of-capacity ranges are cleanly rejected
+# (not split).
 #
 # Env overrides:
 #   SPDK_ROOT  (required) path to a target-capable SPDK build providing a built
@@ -16,7 +18,7 @@
 #              nvmf_tgt; point SPDK_ROOT at a target-capable build in that case.
 #   TEST_BIN   path to the built spdk_kv_block_roundtrip_test binary
 #   BLOCK_SIZE malloc bdev logical block size in bytes (default 512)
-#   DEV_SIZE_MB malloc bdev size in MiB (default 64)
+#   DEV_SIZE_MB malloc bdev size in MiB (default 128, so a ~60 MiB write fits)
 set -euo pipefail
 
 if [[ -z "${SPDK_ROOT:-}" ]]; then
@@ -26,7 +28,7 @@ fi
 TEST_BIN="${TEST_BIN:-$(dirname "$0")/../../../builddir/src/plugins/spdk_kv/spdk_kv_block_roundtrip_test}"
 TEST_BIN="$(readlink -f "$TEST_BIN")"
 BLOCK_SIZE="${BLOCK_SIZE:-512}"
-DEV_SIZE_MB="${DEV_SIZE_MB:-64}"
+DEV_SIZE_MB="${DEV_SIZE_MB:-128}"
 
 nqn="nqn.2026-06.io.spdk:spdk-blk-cnode0"
 bdev_name="SpdkBlkMalloc0"
@@ -44,8 +46,9 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== starting nvmf_tgt =="
-# -s 1024: headroom for mapping the client's up-to-2 MiB DMA staging region.
-"$SPDK_ROOT/build/bin/nvmf_tgt" -r "$rpc_sock" -m 0x1 --no-huge -s 1024 &
+# -s 1536: headroom for the malloc bdev backing store plus mapping the client's
+# up-to-~64 MiB DMA staging region (the region-bounded SGL large-transfer path).
+"$SPDK_ROOT/build/bin/nvmf_tgt" -r "$rpc_sock" -m 0x1 --no-huge -s 1536 &
 nvmfpid=$!
 
 # Wait for the RPC socket to be ready.

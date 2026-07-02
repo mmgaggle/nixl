@@ -23,8 +23,9 @@
  * then:
  *   1. WRITE (DRAM -> remote LBA) => NVMe block write
  *   2. READ  (remote LBA -> DRAM) => NVMe block read
- * and verifies the read-back bytes match byte-for-byte across a sweep of
- * single-range sizes (4 KiB .. 2 MiB) and at a non-zero LBA. It then:
+ * and verifies the read-back bytes match byte-for-byte across a sweep of sizes
+ * from 4 KiB up through the region-bounded SGL range -- 2 MiB (1 region), 8 MiB
+ * (4 regions), and ~60 MiB (30 regions) -- and at a non-zero LBA. It then:
  *   3. distinct-LBA addressing: writes DIFFERENT patterns to two disjoint LBA
  *      ranges and asserts each reads back ITS OWN pattern (so a datapath that
  *      ignored remote.addr and always hit one LBA would fail);
@@ -32,7 +33,8 @@
  * the SPECIFIC expected status (not merely "some non-success"), never a partial
  * transfer:
  *   4. a length that is not a multiple of the sector size => INVALID_PARAM;
- *   5. a length past the single-range (one DMA region) bound => INVALID_PARAM;
+ *   5. a length past the region-bounded single-op bound (~64 MiB; a 68 MiB
+ *      transfer) => INVALID_PARAM, NOT split;
  *   6. an LBA range past the namespace capacity => INVALID_PARAM;
  *   7. QUERY on BLK_SEG => NIXL_ERR_NOT_SUPPORTED (no per-LBA existence).
  *
@@ -57,7 +59,7 @@
 #include "spdk_kv_backend.h"
 
 extern "C" {
-#include "spdk_kv_shim.h" // SPDK_KV_SHIM_DMA_REGION (the single-range bound)
+#include "spdk_kv_shim.h" // SPDK_KV_SHIM_MAX_VALUE_LEN (the single-op bound)
 }
 
 namespace {
@@ -282,18 +284,24 @@ main(int argc, char **argv) {
     }
     std::cout << "engine initialized (block mode) against '" << arg << "'\n";
 
-    // --- Single-range block round-trip across sizes (4 KiB .. 2 MiB) ---
-    // All multiples of 4096, so valid for a 512- or 4096-byte-sector namespace;
-    // each is <= one 2 MiB DMA region (this slice is single-range).
+    // --- Block round-trip across sizes (4 KiB .. ~60 MiB) ---
+    // All multiples of 4096, so valid for a 512- or 4096-byte-sector namespace.
+    // The larger sizes span multiple 2 MiB DMA regions and exercise the
+    // region-bounded SGL: 2 MiB (1 region), 8 MiB (4 regions), 60 MiB (30
+    // regions, near the ~64 MiB single-op bound). A mis-scattered region would
+    // corrupt the byte-for-byte compare.
     {
         const size_t KiB = 1024, MiB = 1024 * 1024;
-        const size_t sizes[] = {4 * KiB, 8 * KiB, 64 * KiB, 256 * KiB, 1 * MiB, 2 * MiB};
+        const size_t sizes[] = {4 * KiB, 8 * KiB, 64 * KiB, 256 * KiB, 1 * MiB,
+                                2 * MiB, 8 * MiB, 60 * MiB};
         for (size_t sz : sizes) {
             if (!writeReadVerify(eng, init.localAgent, /*lba=*/0, sz)) {
                 std::cerr << "FAIL: block round-trip failed at LBA 0 for " << sz << " bytes\n";
                 return 1;
             }
-            std::cout << "block round-trip OK: " << sz << " bytes at LBA 0\n";
+            const size_t regions = (sz + (2 * MiB - 1)) / (2 * MiB);
+            std::cout << "block round-trip OK: " << sz << " bytes at LBA 0 ("
+                      << regions << " x 2 MiB region(s))\n";
         }
     }
 
@@ -360,16 +368,19 @@ main(int argc, char **argv) {
         }
         std::cout << "sector-misaligned length correctly rejected (NIXL_ERR_INVALID_PARAM)\n";
 
-        // Length past the single-range (one 2 MiB DMA region) bound. A multiple
-        // of 4096 so it clears alignment and is caught by the single-range guard.
-        const size_t oversize = static_cast<size_t>(SPDK_KV_SHIM_DMA_REGION) + 4096;
+        // Length past the region-bounded single-op bound (~64 MiB): a 68 MiB
+        // transfer must be REJECTED, NOT split. A multiple of 4096 so it clears
+        // alignment and is caught by the single-op bound guard, before any DMA is
+        // staged (proving the reject is not a partial/striped transfer).
+        const size_t oversize =
+            static_cast<size_t>(SPDK_KV_SHIM_MAX_VALUE_LEN) + 4 * 1024 * 1024;
         if (!expectReject(eng, init.localAgent, /*lba=*/0, oversize, NIXL_ERR_INVALID_PARAM)) {
-            std::cerr << "FAIL: over-single-range length (" << oversize << " B) reject\n";
+            std::cerr << "FAIL: over-single-op-bound length (" << oversize << " B) reject\n";
             return 1;
         }
-        std::cout << "over-single-range length (" << oversize << " B > "
-                  << SPDK_KV_SHIM_DMA_REGION
-                  << " B region) correctly rejected (NIXL_ERR_INVALID_PARAM)\n";
+        std::cout << "oversize length (" << (oversize / (1024 * 1024)) << " MiB > "
+                  << (SPDK_KV_SHIM_MAX_VALUE_LEN / (1024 * 1024))
+                  << " MiB single-op bound) correctly rejected (NIXL_ERR_INVALID_PARAM, not split)\n";
 
         // LBA range past the namespace capacity (well beyond any malloc bdev here).
         const uint64_t far_lba = 1ull << 40;

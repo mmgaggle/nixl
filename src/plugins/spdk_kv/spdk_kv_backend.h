@@ -63,9 +63,11 @@ struct spdk_kv_shim;
  * option (b), one namespace kind per engine; an agent that needs both KV and
  * block opens two engines. For BLK_SEG the remote descriptor's addr is the
  * starting LBA and devId is the namespace; there is NO key derivation and NO
- * value auto-sizing (a block read/write moves exactly len bytes). This slice
- * carries a SINGLE contiguous DMA range per op; the region-bounded SGL for large
- * block ranges is a later slice.
+ * value auto-sizing (a block read/write moves exactly len bytes). A range up to
+ * ~64 MiB rides a single op via the SAME region-bounded SGL as the KV large-value
+ * path (one data-block descriptor per 2 MiB DMA region, bounded by the 33-region
+ * budget); a range past the single-op bound is REJECTED (NIXL_ERR_INVALID_PARAM),
+ * never striped.
  *
  * Operation mapping:
  *   - NIXL_WRITE (local DRAM -> remote OBJ) becomes a KV Store
@@ -196,10 +198,10 @@ private:
     // computeBlockRange: derive the LBA (remote.addr) and sector count for one
     // descriptor pair, enforcing the block semantics -- local/remote byte
     // lengths must match, the length must be a multiple of the namespace sector
-    // size, a single op stays within one DMA region (SINGLE-range slice), and
-    // [LBA, LBA+nlba) must fit the namespace capacity. A zero-length descriptor
-    // yields nlba_out == 0 (a no-op the caller skips). Returns
-    // NIXL_ERR_INVALID_PARAM on any violation.
+    // size, the length must not exceed the region-bounded single-op bound
+    // (~64 MiB; NO striping), and [LBA, LBA+nlba) must fit the namespace
+    // capacity. A zero-length descriptor yields nlba_out == 0 (a no-op the
+    // caller skips). Returns NIXL_ERR_INVALID_PARAM on any violation.
     nixl_status_t
     computeBlockRange(const nixlMetaDesc &local_desc,
                       const nixlMetaDesc &remote_desc,

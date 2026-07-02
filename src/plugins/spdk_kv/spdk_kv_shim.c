@@ -363,6 +363,23 @@ spdk_kv_shim_num_sectors(const struct spdk_kv_shim *sh)
 }
 
 uint32_t
+spdk_kv_shim_max_block_len_op(const struct spdk_kv_shim *sh)
+{
+	/*
+	 * A block op rides the SAME region-bounded SGL as a KV value, so its
+	 * single-op ceiling is the 33-region budget (SPDK_KV_SHIM_MAX_VALUE_LEN,
+	 * ~64 MiB). Mirrors spdk_kv_shim_max_value_len_op for the block path; there
+	 * is no block-namespace-advertised limit smaller than the budget to clamp
+	 * to here (the ~64 MiB budget matches the vfio-user target max_io_size).
+	 * Returns 0 for a non-block shim so BLK_SEG is unavailable there.
+	 */
+	if (sh == NULL || !sh->is_block) {
+		return 0;
+	}
+	return SPDK_KV_SHIM_MAX_VALUE_LEN;
+}
+
+uint32_t
 spdk_kv_shim_max_value_len(const struct spdk_kv_shim *sh)
 {
 	return sh ? sh->kvvml : 0;
@@ -593,16 +610,22 @@ spdk_kv_shim_exist(struct spdk_kv_shim *sh, const void *key, uint8_t key_len)
 }
 
 /*
- * Shared block read/write datapath. A SINGLE contiguous DMA range per op
- * (spdk_nvme_ns_cmd_read/write build the PRP/SGL); the region-bounded SGL for
- * multi-region block ranges is a later slice, so callers cap a single op at one
- * DMA region and pass a region-aligned staging buffer. Reuses the same bounded
+ * Shared block read/write datapath. Submits lba_count sectors described by the
+ * SAME region-bounded SGL as the KV large-value path: the transfer's byte length
+ * (lba_count * sector_size) is walked by the shared kv_reset_sgl()/kv_next_sge()
+ * iterator, one 2 MiB-region-bounded segment per data-block descriptor (the
+ * qpair's PCIe SGL merge is disabled in open(), so no descriptor spans a region
+ * boundary). This carries a range up to ~64 MiB (the 33-region budget) on a
+ * single op via spdk_nvme_ns_cmd_readv/writev. NO striping: a range beyond the
+ * region budget is REJECTED here (-EFBIG), never split. Reuses the same bounded
  * poll loop and completion capture as the KV ops.
  */
 static int
 blk_rw(struct spdk_kv_shim *sh, bool is_write, void *buf, uint64_t lba,
        uint32_t lba_count)
 {
+	uint64_t total_bytes;
+	uint32_t byte_len;
 	int rc;
 
 	if (sh == NULL || buf == NULL || lba_count == 0) {
@@ -619,13 +642,39 @@ blk_rw(struct spdk_kv_shim *sh, bool is_write, void *buf, uint64_t lba,
 		return -EINVAL;
 	}
 
+	/*
+	 * Total transfer length in bytes drives the region-bounded SGL, exactly as
+	 * the KV value length does. Compute in 64-bit and reject past the single-op
+	 * bound BEFORE truncating to the uint32 the region iterator uses, so a range
+	 * that would overflow uint32 (or merely exceed the ~64 MiB budget) is caught
+	 * here rather than wrapping. NO striping.
+	 */
+	total_bytes = (uint64_t)lba_count * sh->sector_size;
+	if (total_bytes > SPDK_KV_SHIM_MAX_VALUE_LEN) {
+		return -EFBIG;
+	}
+	byte_len = (uint32_t)total_bytes;
+	/*
+	 * Authoritative region-budget guard (mirrors kv_xfer_sgl): reject a buffer
+	 * that needs more than NVMF_REQ_MAX_BUFFERS (33) region-bounded descriptors.
+	 */
+	if (kv_region_count(buf, byte_len) > SPDK_KV_SHIM_MAX_SGL_REGIONS) {
+		return -EFBIG;
+	}
+
+	sh->sgl_base = buf;
+	sh->sgl_total = byte_len;
+	sh->sgl_off = 0;
+
 	sh->op_done = false;
 	if (is_write) {
-		rc = spdk_nvme_ns_cmd_write(sh->ns, sh->qpair, buf, lba, lba_count,
-					    io_complete, sh, 0);
+		rc = spdk_nvme_ns_cmd_writev(sh->ns, sh->qpair, lba, lba_count,
+					     io_complete, sh, 0,
+					     kv_reset_sgl, kv_next_sge);
 	} else {
-		rc = spdk_nvme_ns_cmd_read(sh->ns, sh->qpair, buf, lba, lba_count,
-					   io_complete, sh, 0);
+		rc = spdk_nvme_ns_cmd_readv(sh->ns, sh->qpair, lba, lba_count,
+					    io_complete, sh, 0,
+					    kv_reset_sgl, kv_next_sge);
 	}
 	if (rc != 0) {
 		return rc < 0 ? rc : -rc;

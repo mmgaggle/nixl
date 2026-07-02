@@ -188,9 +188,9 @@ void *spdk_kv_shim_dma_alloc(size_t len);
 /**
  * Allocate a DMA-capable buffer of \c len bytes (zeroed) aligned to \c align
  * bytes (a power of two). NULL on failure. The block datapath aligns its
- * single-range staging buffer to a 2 MiB DMA region (SPDK_KV_SHIM_DMA_REGION)
- * so a transfer up to one region never straddles two independently-mapped
- * vfio-user regions; the multi-region SGL block path is a later slice.
+ * staging buffer to a 2 MiB DMA region (SPDK_KV_SHIM_DMA_REGION) so each 2 MiB
+ * span becomes its own region-bounded data-block descriptor and no descriptor
+ * straddles two independently-mapped vfio-user regions.
  */
 void *spdk_kv_shim_dma_alloc_aligned(size_t len, size_t align);
 
@@ -265,8 +265,10 @@ int spdk_kv_shim_exist(struct spdk_kv_shim *sh, const void *key, uint8_t key_len
  * Available only on a shim opened with ns_kind == SPDK_KV_SHIM_NS_KIND_BLOCK.
  * Addressing is by LBA (sector), not by key: the caller converts a byte length
  * to an LBA count using spdk_kv_shim_sector_size() and bounds the range with
- * spdk_kv_shim_num_sectors(). SINGLE contiguous DMA range per op (this slice);
- * the region-bounded SGL block path is a later slice.
+ * spdk_kv_shim_num_sectors(). A range up to ~64 MiB rides a single op via the
+ * SAME region-bounded SGL as the KV large-value path (one data-block descriptor
+ * per 2 MiB DMA region, bounded by the 33-region budget); a range past
+ * spdk_kv_shim_max_block_len_op() is REJECTED (-EFBIG), never striped.
  * ------------------------------------------------------------------------ */
 
 /** Logical block (sector) size in bytes of the bound block namespace, or 0 if
@@ -278,21 +280,32 @@ uint32_t spdk_kv_shim_sector_size(const struct spdk_kv_shim *sh);
 uint64_t spdk_kv_shim_num_sectors(const struct spdk_kv_shim *sh);
 
 /**
+ * Largest block transfer (in bytes) carryable in a single op: the region-bounded
+ * SGL budget (SPDK_KV_SHIM_MAX_VALUE_LEN, ~64 MiB), mirroring
+ * spdk_kv_shim_max_value_len_op() for the block path. Returns 0 for a non-block
+ * shim. A read/write above this is REJECTED (-EFBIG), NOT striped.
+ */
+uint32_t spdk_kv_shim_max_block_len_op(const struct spdk_kv_shim *sh);
+
+/**
  * Block write: copy \c lba_count sectors from the DMA-capable \c buf to the
- * namespace starting at \c lba (spdk_nvme_ns_cmd_write). \c buf must come from
- * spdk_kv_shim_dma_alloc[_aligned](). \c lba_count must be nonzero and
- * [\c lba, \c lba + lba_count) must stay within spdk_kv_shim_num_sectors().
+ * namespace starting at \c lba (spdk_nvme_ns_cmd_writev with the region-bounded
+ * SGL). \c buf must come from spdk_kv_shim_dma_alloc[_aligned](). \c lba_count
+ * must be nonzero and [\c lba, \c lba + lba_count) must stay within
+ * spdk_kv_shim_num_sectors(). A transfer larger than
+ * spdk_kv_shim_max_block_len_op() is rejected with -EFBIG (NOT striped).
  *
  * \return per the return convention documented at the top of this header
- *         (0 on success; -EINVAL on a bad/out-of-range request; -ENXIO etc.).
+ *         (0 on success; -EINVAL on a bad/out-of-range request; -EFBIG when
+ *         past the single-op bound; -ENXIO etc.).
  */
 int spdk_kv_shim_write(struct spdk_kv_shim *sh, const void *buf, uint64_t lba,
 		       uint32_t lba_count);
 
 /**
  * Block read: copy \c lba_count sectors from the namespace starting at \c lba
- * into the DMA-capable \c buf (spdk_nvme_ns_cmd_read). Same buffer/bounds rules
- * as spdk_kv_shim_write().
+ * into the DMA-capable \c buf (spdk_nvme_ns_cmd_readv with the region-bounded
+ * SGL). Same buffer/bounds/size rules as spdk_kv_shim_write().
  *
  * \return per the return convention documented at the top of this header.
  */
