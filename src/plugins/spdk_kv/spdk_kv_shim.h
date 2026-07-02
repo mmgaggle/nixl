@@ -26,15 +26,17 @@
  * Key-Value namespace, and exposes synchronous Store / Retrieve primitives
  * backed by SPDK-DMA buffers and a bounded qpair poll loop.
  *
- * Scope (walking skeleton): Store + Retrieve of small values in host DRAM
- * only. It carries NO backend-specific behavior, NO KV Exec, and NO long-key
- * handling. Exist/Delete/List, value auto-sizing, large-value SGL, and
- * VRAM/P2PDMA are deliberately left for later.
+ * Scope: Store + Retrieve + Exist of small/moderate values in host DRAM only,
+ * plus value auto-sizing on Retrieve (the completion cdw0 true-length is
+ * surfaced so a short buffer can be resized and retried). It carries NO
+ * backend-specific behavior, NO KV Exec, and NO long-key handling. Delete/List,
+ * the large-value region-bounded SGL, and VRAM/P2PDMA are deliberately left for
+ * later.
  *
  * This header is a plain C ABI (wrapped in extern "C") so the C++ NIXL backend
  * TU can link it while keeping the C-only SPDK headers isolated in the C TU.
  *
- * Return convention for the op functions (store/retrieve):
+ * Return convention for the op functions (store/retrieve/exist):
  *   -  0 on SUCCESS (NVMe status code 0x00).
  *   -  a POSITIVE NVMe status code (sc) for a device-reported logical status
  *      when the status-code type (sct) is GENERIC (e.g. 0x85 BUFFER_TOO_SMALL,
@@ -57,6 +59,19 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/*
+ * NVMe generic status codes surfaced verbatim through the op return convention,
+ * mirrored here so includers do NOT need the SPDK headers to recognize them.
+ * (Values from enum spdk_nvme_generic_command_status_code in nvme_spec.h.)
+ */
+/** Retrieve buffer too small: the stored value is longer than the host buffer.
+ *  NVMe generic sc 0x85 (SPDK_NVME_SC_INVALID_VALUE_SIZE), surfaced here as
+ *  BUFFER_TOO_SMALL. On this return the true length is reported for resize. */
+#define SPDK_KV_SHIM_SC_BUFFER_TOO_SMALL 0x85
+/** Key not present (Exist miss, or Retrieve/Delete of an absent key).
+ *  NVMe generic sc 0x87 (SPDK_NVME_SC_KV_KEY_DOES_NOT_EXIST). */
+#define SPDK_KV_SHIM_SC_KEY_DOES_NOT_EXIST 0x87
 
 /** Opaque shim handle. */
 struct spdk_kv_shim;
@@ -142,15 +157,37 @@ int spdk_kv_shim_store(struct spdk_kv_shim *sh, const void *key, uint8_t key_len
 
 /**
  * KV Retrieve the value for \c key into \c value (\c buf_len bytes). \c value
- * must be a DMA-capable buffer. On SUCCESS \c *value_len_out (when non-NULL) is
- * set to the device's TRUE value length (completion cdw0), which may exceed
- * \c buf_len if the buffer was too small. \c *value_len_out is written ONLY on
- * success (return 0).
+ * must be a DMA-capable buffer.
+ *
+ * Value auto-sizing: the completion cdw0 reports the device's TRUE stored value
+ * length, which \c *value_len_out (when non-NULL) receives on both of the
+ * value-bearing returns below so a short buffer can be resized and retried:
+ *   - return 0 (SUCCESS): the whole value fit; \c *value_len_out is the true
+ *     length and is <= \c buf_len (the first \c *value_len_out bytes are valid).
+ *   - return SPDK_KV_SHIM_SC_BUFFER_TOO_SMALL (0x85): the stored value is longer
+ *     than \c buf_len; \c *value_len_out is the true length (> \c buf_len) and
+ *     the buffer holds at most \c buf_len bytes of a longer value (treat the
+ *     contents as unusable). The caller resizes to \c *value_len_out and
+ *     re-Retrieves. Devices signal a short buffer two ways -- SUCCESS with
+ *     cdw0 > buf_len, or 0x85 directly -- and BOTH are normalized to this 0x85
+ *     return so the caller has one contract.
+ * On any other return (absent key 0x87, other device sc, or a negated errno)
+ * \c *value_len_out is left untouched.
  *
  * \return per the return convention documented at the top of this header.
  */
 int spdk_kv_shim_retrieve(struct spdk_kv_shim *sh, const void *key, uint8_t key_len,
 			  void *value, uint32_t buf_len, uint32_t *value_len_out);
+
+/**
+ * KV Exist: query whether \c key is present. This maps NIXL queryMem / QUERY to
+ * the NVMe-KV Exist op; it transfers NO value data (cache hit/miss only).
+ *
+ * \return 0 if the key exists (hit); SPDK_KV_SHIM_SC_KEY_DOES_NOT_EXIST (0x87)
+ * if absent (miss); another positive NVMe sc for a device error; a negated
+ * errno for submit-/transport-level errors -- per the return convention above.
+ */
+int spdk_kv_shim_exist(struct spdk_kv_shim *sh, const void *key, uint8_t key_len);
 
 #ifdef __cplusplus
 }

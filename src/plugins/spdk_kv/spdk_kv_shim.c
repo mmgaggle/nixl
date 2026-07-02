@@ -346,9 +346,61 @@ spdk_kv_shim_retrieve(struct spdk_kv_shim *sh, const void *key, uint8_t key_len,
 		return rc;
 	}
 	rc = status_to_rc(sh);
-	/* On SUCCESS, cdw0 carries the device's TRUE value length. */
-	if (rc == 0 && value_len_out != NULL) {
-		*value_len_out = sh->op_cdw0;
+
+	/*
+	 * Value auto-sizing. cdw0 carries the device's TRUE stored value length
+	 * on the value-bearing completions. A short host buffer is signalled two
+	 * ways depending on the device, and we NORMALIZE both to a single
+	 * BUFFER_TOO_SMALL (0x85) return so the caller has one contract:
+	 *   (a) the device completes SUCCESS (sc 0x00) with cdw0 > buf_len -- it
+	 *       transferred the leading buf_len bytes and reports the full length
+	 *       (this KV target's behavior, per the NVMe-KV spec); or
+	 *   (b) the device completes 0x85 INVALID_VALUE_SIZE directly with cdw0 =
+	 *       the true length.
+	 * In both cases the buffer holds at most buf_len bytes of a longer value,
+	 * so we surface 0x85 and hand back the true length; the caller resizes to
+	 * *value_len_out and re-Retrieves.
+	 */
+	if (rc == 0) {
+		if (value_len_out != NULL) {
+			*value_len_out = sh->op_cdw0;
+		}
+		if (sh->op_cdw0 > buf_len) {
+			/* (a) SUCCESS but the value did not fit the buffer. */
+			return SPDK_NVME_SC_INVALID_VALUE_SIZE;
+		}
+		return 0;
+	}
+	if (rc == SPDK_NVME_SC_INVALID_VALUE_SIZE) {
+		/* (b) device signalled too-small directly; cdw0 is the true length. */
+		if (value_len_out != NULL) {
+			*value_len_out = sh->op_cdw0;
+		}
 	}
 	return rc;
+}
+
+int
+spdk_kv_shim_exist(struct spdk_kv_shim *sh, const void *key, uint8_t key_len)
+{
+	int rc;
+
+	if (sh == NULL) {
+		return -EINVAL;
+	}
+	sh->op_done = false;
+	rc = spdk_nvme_kv_exist(sh->ns, sh->qpair, key, key_len, io_complete, sh);
+	if (rc != 0) {
+		return rc < 0 ? rc : -rc;
+	}
+	rc = poll_to_completion(sh);
+	if (rc != 0) {
+		return rc;
+	}
+	/*
+	 * status_to_rc maps a GENERIC completion to its NVMe sc: 0x00 -> 0 (the
+	 * key exists / hit), 0x87 KEY_DOES_NOT_EXIST -> 0x87 (absent / miss). No
+	 * value data is transferred either way.
+	 */
+	return status_to_rc(sh);
 }

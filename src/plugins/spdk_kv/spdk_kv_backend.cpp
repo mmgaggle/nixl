@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <optional>
 
 #include "common/nixl_log.h"
 
@@ -49,6 +50,11 @@ public:
     ~nixlSpdkKvBackendReqH() override = default;
 
     nixl_status_t status = NIXL_IN_PROG;
+    // Value auto-sizing: per-descriptor device TRUE value length recorded when a
+    // READ's host buffer was too small (status == NIXL_ERR_MISMATCH). Sized to
+    // the descriptor count in postXfer; 0 means "no too-small result recorded"
+    // (the READ fit, or this descriptor was not reached). Read by getReqTrueLen.
+    std::vector<size_t> true_lens;
 };
 
 // Parse "true"/"1"/"yes"/"on" (case-insensitive) as boolean true.
@@ -234,6 +240,9 @@ nixlSpdkKvEngine::postXfer(const nixl_xfer_op_t &operation,
         return NIXL_ERR_BACKEND;
     }
     auto *req_h = static_cast<nixlSpdkKvBackendReqH *>(handle);
+    // One true-length slot per descriptor for value auto-sizing (all 0 until a
+    // READ reports a too-small host buffer).
+    req_h->true_lens.assign(local.descCount(), 0);
 
     for (int i = 0; i < local.descCount(); ++i) {
         const auto &local_desc = local[i];
@@ -301,21 +310,26 @@ nixlSpdkKvEngine::postXfer(const nixl_xfer_op_t &operation,
                                        static_cast<uint32_t>(data_len),
                                        &value_len_out);
             if (rc == 0) {
-                // value_len_out is the device's TRUE value length. This
-                // skeleton handles small values sized to exactly the transfer
-                // length; any mismatch means the request cannot be satisfied
-                // exactly (a larger value would be truncated -> silent data
-                // loss; a shorter one would leave the buffer tail undefined).
-                // Surface it as an error rather than copying a partial value.
-                // Value auto-sizing / resize-and-retry is deferred.
-                if (value_len_out != data_len) {
-                    NIXL_ERROR << "SPDK_KV: stored value length " << value_len_out
-                               << " != requested transfer length " << data_len
-                               << " for descriptor " << i << "; refusing partial copy";
-                    rc = -1;
-                } else {
-                    std::memcpy(data_ptr, dma, data_len);
-                }
+                // The whole value fit: value_len_out is the device's TRUE value
+                // length and is <= data_len. Copy exactly the value bytes (a
+                // value shorter than the buffer leaves the caller's tail as-is;
+                // we never over-read the staging buffer).
+                std::memcpy(data_ptr, dma, value_len_out);
+            } else if (rc == SPDK_KV_SHIM_SC_BUFFER_TOO_SMALL) {
+                // Value auto-sizing: the stored value is larger than the host
+                // buffer, so value_len_out is the TRUE length. Do NOT copy a
+                // truncated value (silent data loss). Record the true length so
+                // the caller can resize its buffer/descriptor and re-Retrieve,
+                // and report a distinct MISMATCH status (not a generic backend
+                // error). Retrieved via getReqTrueLen(handle, i).
+                req_h->true_lens[i] = value_len_out;
+                NIXL_WARN << "SPDK_KV: value (" << value_len_out
+                          << " B) exceeds host buffer (" << data_len
+                          << " B) for descriptor " << i
+                          << "; reporting true length for resize+retry";
+                spdk_kv_shim_dma_free(dma);
+                req_h->status = NIXL_ERR_MISMATCH;
+                return NIXL_ERR_MISMATCH;
             } else {
                 NIXL_ERROR << "SPDK_KV: spdk_kv_shim_retrieve failed: rc=" << rc;
             }
@@ -351,4 +365,66 @@ nixlSpdkKvEngine::releaseReqH(nixlBackendReqH *handle) const {
     }
     delete static_cast<nixlSpdkKvBackendReqH *>(handle);
     return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlSpdkKvEngine::queryMem(const nixl_reg_dlist_t &descs,
+                          std::vector<nixl_query_resp_t> &resp) const {
+    // Mirror the OBJ backend's queryMem result/absence convention exactly:
+    //   - resp is sized to descCount() and defaulted to std::nullopt (absent).
+    //   - present => resp[i] = nixl_query_resp_t{nixl_b_params_t{}} (engaged).
+    //   - absent  => resp[i] = std::nullopt (left as the default).
+    //   - a submit-/transport-level error returns an error status rather than
+    //     encoding it as "absent", so a failure is never masked as a cache miss.
+    resp.assign(descs.descCount(), std::nullopt);
+
+    if (descs.getType() != OBJ_SEG) {
+        NIXL_ERROR << "SPDK_KV: queryMem memory type must be OBJ_SEG, got " << descs.getType();
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+    if (!shim_) {
+        NIXL_ERROR << "SPDK_KV: shim not initialized";
+        return NIXL_ERR_BACKEND;
+    }
+
+    for (int i = 0; i < descs.descCount(); ++i) {
+        // The OBJ_SEG descriptor carries the NIXL block identifier in metaInfo;
+        // take it VERBATIM as the opaque inline key (same mapping as registerMem).
+        std::vector<uint8_t> key;
+        if (!spdkKvKeyFromBlobId(descs[i].metaInfo, maxKeyLen_, key)) {
+            NIXL_ERROR << "SPDK_KV: invalid KV key in metaInfo (empty or > "
+                       << static_cast<unsigned>(maxKeyLen_)
+                       << " bytes) in queryMem descriptor " << i;
+            return NIXL_ERR_INVALID_PARAM;
+        }
+
+        int rc = spdk_kv_shim_exist(shim_, key.data(), static_cast<uint8_t>(key.size()));
+        if (rc == 0) {
+            // Hit.
+            resp[i] = nixl_query_resp_t{nixl_b_params_t{}};
+        } else if (rc == SPDK_KV_SHIM_SC_KEY_DOES_NOT_EXIST) {
+            // Miss. Leave resp[i] as std::nullopt.
+            resp[i] = std::nullopt;
+        } else {
+            // Positive device sc other than KEY_DOES_NOT_EXIST, or a negated
+            // errno: a real error, NOT a miss.
+            NIXL_ERROR << "SPDK_KV: spdk_kv_shim_exist failed for descriptor "
+                       << i << ": rc=" << rc;
+            return NIXL_ERR_BACKEND;
+        }
+    }
+
+    return NIXL_SUCCESS;
+}
+
+size_t
+nixlSpdkKvEngine::getReqTrueLen(nixlBackendReqH *handle, int idx) const {
+    if (!handle || idx < 0) {
+        return 0;
+    }
+    const auto *req_h = static_cast<const nixlSpdkKvBackendReqH *>(handle);
+    if (static_cast<size_t>(idx) >= req_h->true_lens.size()) {
+        return 0;
+    }
+    return req_h->true_lens[idx];
 }

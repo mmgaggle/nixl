@@ -27,21 +27,25 @@ SPDK KV backend.
 It carries **no backend-specific behavior, no KV Exec, and no long-key path** by
 design.
 
-This directory implements the **walking skeleton** — the small-value Store /
-Retrieve datapath.
+This directory implements the **walking skeleton** plus **Exist (QUERY) and
+value auto-sizing**.
 
 ## Scope
 
 In:
 - NIXL `WRITE` → KV **Store**, NIXL `READ` → KV **Retrieve**.
+- NIXL `queryMem` / QUERY → KV **Exist** (cache hit/miss, **no data transfer**).
+- **Value auto-sizing** on Retrieve: a short host buffer surfaces the device's
+  **TRUE value length** (completion `cdw0`) so the caller can **resize and
+  re-Retrieve** instead of silently truncating.
 - **16-byte inline keys**, taken **verbatim** (opaque; no lineage parsing).
-- **Small values** in **host DRAM**.
+- **Small/moderate values** in **host DRAM** (single staging buffer per op).
 - Connect via a **standard SPDK transport ID** (`trtype:VFIOUSER traddr:<sock>`).
 
 Out:
 - VRAM / P2PDMA.
-- Large values via a region-bounded SGL, and value auto-sizing.
-- Exist/QUERY, Delete/List.
+- Large-value **region-bounded (multi-region) SGL** up to ~64 MiB.
+- Delete/List, as needed.
 - Device-mode (`PCIE`) transport parity.
 - KV **Exec** and **long keys** — permanently out of scope for this generic
   plugin.
@@ -52,12 +56,17 @@ Out:
 | -------------- | ---------- | ---------- | --------------- |
 | `NIXL_WRITE`   | `DRAM_SEG` | `OBJ_SEG`  | KV **Store**    |
 | `NIXL_READ`    | `DRAM_SEG` | `OBJ_SEG`  | KV **Retrieve** |
+| `queryMem`     | —          | `OBJ_SEG`  | KV **Exist**    |
 
 The remote `OBJ_SEG` descriptor carries the NIXL block identifier in its
 `metaInfo` blob. The engine takes those bytes **verbatim** as the inline NVMe-KV
 key (1–16 bytes). An empty or over-16-byte key is **rejected**
 (`NIXL_ERR_INVALID_PARAM`), never truncated (truncation would alias distinct
 keys sharing a prefix and corrupt data).
+
+`queryMem` returns per the OBJ/file convention: `resp[i]` **engaged** (an empty
+params map) on a **hit**, `std::nullopt` on a **miss**. A submit-/transport-level
+failure returns an error status (never masked as a miss).
 
 ## Design decisions
 
@@ -82,6 +91,16 @@ keys sharing a prefix and corrupt data).
 - **DRAM staging.** SPDK Store/Retrieve need DMA-capable buffers; registered
   user DRAM generally is not, so the plugin stages through a per-request SPDK
   DMA buffer and copies. A future revision registers user/GPU buffers directly.
+- **Value auto-sizing.** On Retrieve the completion `cdw0` carries the device's
+  TRUE stored length. Devices signal a short host buffer two ways — SUCCESS with
+  `cdw0 > buf_len` (this KV target), or `0x85 INVALID_VALUE_SIZE` directly — and
+  the shim **normalizes both** to a single `BUFFER_TOO_SMALL` (`0x85`) return
+  that reports the true length. The
+  backend then does **not** copy a truncated value; it records the true length
+  and reports `NIXL_ERR_MISMATCH`, so the caller resizes and re-Retrieves. The
+  true length is read back with `getReqTrueLen(handle, idx)`. This implements
+  the **optimistic-then-resize** strategy; a size-cache and a 2-RTT probe-first
+  variant are left for later.
 
 ## Custom backend parameters (`nixl_b_params_t`)
 
@@ -119,8 +138,14 @@ ninja -C builddir src/plugins/spdk_kv/libplugin_SPDK_KV.so \
 `run_roundtrip.sh` stands up an SPDK `nvmf_tgt` with an **in-memory** KV
 namespace (`kvdev_mem`, **no Ceph**) over VFIOUSER and runs the round-trip test:
 Store a small value under a 16-byte key, Retrieve it back, and verify
-byte-for-byte. It also checks the opaque key guards and the short-read (no
-silent truncation) behavior.
+byte-for-byte. It also checks the opaque key guards, **QUERY/Exist** (hit on a
+stored key, miss on an absent key), and **value auto-sizing** (a short-buffer
+READ reports the true length, then a correctly-sized READ returns byte-exact).
+
+Note: the round-trip needs a **target-capable** KV SPDK build (one whose
+`nvmf_tgt` has the `kvdev_mem` module + KV nvmf namespace RPCs). Point
+`SPDK_ROOT` at that tree; the host-side SPDK the plugin links against may carry
+only the NVMe-KV *host* driver.
 
 ```bash
 SPDK_ROOT=/path/to/spdk ./run_roundtrip.sh

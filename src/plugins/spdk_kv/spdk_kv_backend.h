@@ -35,14 +35,19 @@ struct spdk_kv_shim;
  * in-memory kvdev, a librados-backed kvdev, a DPU-presented VF, ...); it
  * carries NO backend-specific behavior, NO KV Exec, and NO long-key path.
  *
- * SCOPE -- walking skeleton:
- *   - Store (NIXL_WRITE) and Retrieve (NIXL_READ) of SMALL values in host DRAM.
+ * SCOPE -- Exist + value auto-sizing:
+ *   - Store (NIXL_WRITE) and Retrieve (NIXL_READ) of small/moderate values in
+ *     host DRAM.
+ *   - Exist (NIXL queryMem / QUERY -> KV Exist): cache hit/miss, NO data xfer.
+ *   - Value auto-sizing on Retrieve: a short host buffer surfaces the device's
+ *     TRUE value length (completion cdw0) so the caller can resize and re-READ,
+ *     instead of silently truncating.
  *   - 16-byte inline keys taken verbatim (opaque); no lineage parsing.
  *   - DRAM only. VRAM / P2PDMA is deferred.
- *   - Small values only. Large-value region-bounded SGL + value auto-sizing is
- *     deferred.
- *   - NO Exist/QUERY, NO Delete/List (deferred), NO KV Exec (out of scope
- *     for this generic plugin by design).
+ *   - Single-buffer values only. The large-value region-bounded (multi-region)
+ *     SGL is deferred.
+ *   - NO Delete/List (deferred), NO KV Exec (out of scope for this generic
+ *     plugin by design).
  *
  * Memory-type mapping (storage-backend shape, mirrors OBJ):
  *   - local  source/destination : DRAM_SEG (host DRAM)
@@ -145,6 +150,24 @@ public:
 
     nixl_status_t
     releaseReqH(nixlBackendReqH *handle) const override;
+
+    // QUERY -> NVMe-KV Exist. Mirrors the OBJ backend's queryMem convention:
+    //   present => resp[i] engaged (empty params); absent => std::nullopt.
+    // A transport/backend error returns an error status (never masked as a
+    // miss), so a real failure is not mistaken for a cache miss. Transfers no
+    // value data.
+    nixl_status_t
+    queryMem(const nixl_reg_dlist_t &descs,
+             std::vector<nixl_query_resp_t> &resp) const override;
+
+    // Value auto-sizing helper. After a postXfer READ that reported
+    // NIXL_ERR_MISMATCH because the host buffer was too small, this returns the
+    // device's TRUE value length (completion cdw0) recorded for descriptor
+    // \c idx, so the caller can resize its buffer/descriptor and re-Retrieve.
+    // Returns 0 when the handle recorded no true length for \c idx (e.g. the
+    // READ fit, or \c idx is out of range).
+    size_t
+    getReqTrueLen(nixlBackendReqH *handle, int idx = 0) const;
 
 private:
     // Ratified maximum NVMe-KV inline key length (bytes).

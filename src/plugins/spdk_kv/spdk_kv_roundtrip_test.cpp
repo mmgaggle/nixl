@@ -14,15 +14,22 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
- * Direct-engine round-trip test for the generic SPDK_KV backend.
+ * Direct-engine round-trip test for the generic SPDK_KV backend (Store /
+ * Retrieve, Exist, and value auto-sizing).
  *
  * Instantiates nixlSpdkKvEngine directly (no nixlAgent), registers a DRAM
  * source buffer and an OBJ_SEG remote descriptor carrying a 16-byte inline key
  * (verbatim, opaque) in metaInfo, then:
  *   1. WRITE (DRAM -> remote)  => KV Store
  *   2. READ  (remote -> DRAM)  => KV Retrieve
- * and verifies the retrieved bytes match the stored bytes. Also exercises the
- * opaque key-mapping guards (empty rejected, over-16-byte rejected, verbatim).
+ * and verifies the retrieved bytes match the stored bytes. It then exercises:
+ *   3. the opaque key-mapping guards (empty rejected, over-16-byte rejected,
+ *      taken verbatim);
+ *   4. QUERY (queryMem => KV Exist): a stored key reports a hit and an absent
+ *      key reports a miss (no data transfer);
+ *   5. value auto-sizing: a short-buffer READ reports the device's TRUE value
+ *      length (no silent truncation) and a subsequent correctly-sized READ
+ *      returns the value byte-exact.
  *
  * Usage: spdk_kv_roundtrip_test <transport-id-or-vfio-user-dir>
  *   e.g. spdk_kv_roundtrip_test "trtype:VFIOUSER traddr:/tmp/.../muser0/0"
@@ -32,6 +39,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -202,8 +210,39 @@ main(int argc, char **argv) {
         std::cout << "key mapping: 16-byte id verbatim; empty and >16-byte rejected\n";
     }
 
-    // --- Short-read regression: a READ whose transfer length does not match
-    // the stored value length must error, not silently truncate. ---
+    // --- QUERY => KV Exist: the stored key reports a hit; an absent key
+    // reports a miss. No value data is transferred either way. ---
+    {
+        // Hit: the key we just Stored.
+        nixl_reg_dlist_t q_hit(OBJ_SEG);
+        q_hit.addDesc(nixlBlobDesc(0, 0, key_dev, kv_key));
+        std::vector<nixl_query_resp_t> resp_hit;
+        nixl_status_t qs = eng.queryMem(q_hit, resp_hit);
+        if (qs != NIXL_SUCCESS || resp_hit.size() != 1 || !resp_hit[0].has_value()) {
+            std::cerr << "FAIL: QUERY on stored key '" << kv_key
+                      << "' did not report a hit (status=" << qs
+                      << ", n=" << resp_hit.size() << ")\n";
+            return 1;
+        }
+
+        // Miss: a 16-byte key that was never Stored.
+        const std::string absent_key = "nixl-key-ABSENT!"; // 16 bytes, never stored
+        nixl_reg_dlist_t q_miss(OBJ_SEG);
+        q_miss.addDesc(nixlBlobDesc(0, 0, key_dev, absent_key));
+        std::vector<nixl_query_resp_t> resp_miss;
+        qs = eng.queryMem(q_miss, resp_miss);
+        if (qs != NIXL_SUCCESS || resp_miss.size() != 1 || resp_miss[0].has_value()) {
+            std::cerr << "FAIL: QUERY on absent key '" << absent_key
+                      << "' did not report a miss (status=" << qs
+                      << ", n=" << resp_miss.size() << ")\n";
+            return 1;
+        }
+        std::cout << "QUERY (KV Exist): stored key -> hit, absent key -> miss\n";
+    }
+
+    // --- Value auto-sizing: a short-buffer READ reports the device's TRUE
+    // value length (no silent truncation), then a correctly-sized re-Retrieve
+    // returns the value byte-exact. ---
     {
         const size_t short_len = 10; // < payload.size()
         std::vector<uint8_t> short_dst(short_len, 0);
@@ -221,15 +260,54 @@ main(int argc, char **argv) {
         }
         nixl_status_t ps = eng.postXfer(NIXL_READ, s_local, s_remote, init.localAgent, h);
         nixl_status_t cs = eng.checkXfer(h);
-        eng.releaseReqH(h);
-        if (ps == NIXL_SUCCESS || cs == NIXL_SUCCESS) {
+        if (ps != NIXL_ERR_MISMATCH || cs != NIXL_ERR_MISMATCH) {
             std::cerr << "FAIL: short READ (" << short_len << " bytes) of a "
-                      << payload.size() << "-byte value did NOT error (post=" << ps
-                      << " check=" << cs << ")\n";
+                      << payload.size() << "-byte value did NOT report MISMATCH (post="
+                      << ps << " check=" << cs << ")\n";
+            eng.releaseReqH(h);
             return 1;
         }
-        std::cout << "short READ (" << short_len << " bytes) of a " << payload.size()
-                  << "-byte value correctly errored (no silent truncation)\n";
+        const size_t true_len = eng.getReqTrueLen(h, 0);
+        eng.releaseReqH(h);
+        if (true_len != payload.size()) {
+            std::cerr << "FAIL: short READ reported true length " << true_len
+                      << ", expected " << payload.size() << "\n";
+            return 1;
+        }
+        std::cout << "short READ (" << short_len << " bytes) reported true length "
+                  << true_len << " (no silent truncation)\n";
+
+        // Resize to the reported true length and re-Retrieve => byte-exact.
+        std::vector<uint8_t> resized_dst(true_len, 0);
+        nixl_meta_dlist_t r_local(DRAM_SEG);
+        r_local.addDesc(nixlMetaDesc(
+            reinterpret_cast<uintptr_t>(resized_dst.data()), true_len, dram_dev, dram_md));
+        nixl_meta_dlist_t r_remote(OBJ_SEG);
+        r_remote.addDesc(nixlMetaDesc(0, true_len, key_dev, key_md));
+
+        nixlBackendReqH *rh = nullptr;
+        if (eng.prepXfer(NIXL_READ, r_local, r_remote, init.localAgent, rh) != NIXL_SUCCESS) {
+            std::cerr << "FAIL: prepXfer(resized READ) failed\n";
+            return 1;
+        }
+        nixl_status_t rps = eng.postXfer(NIXL_READ, r_local, r_remote, init.localAgent, rh);
+        if (rps != NIXL_SUCCESS && rps != NIXL_IN_PROG) {
+            std::cerr << "FAIL: postXfer(resized READ) status=" << rps << "\n";
+            eng.releaseReqH(rh);
+            return 1;
+        }
+        if (!checkComplete(eng, rh)) {
+            std::cerr << "FAIL: resized READ did not complete\n";
+            eng.releaseReqH(rh);
+            return 1;
+        }
+        eng.releaseReqH(rh);
+        if (resized_dst != src) {
+            std::cerr << "FAIL: resized READ data mismatch after auto-sizing\n";
+            return 1;
+        }
+        std::cout << "resized READ (" << true_len
+                  << " bytes) after auto-sizing matches byte-exact\n";
     }
 
     eng.deregisterMem(key_md);
