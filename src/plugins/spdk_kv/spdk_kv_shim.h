@@ -81,8 +81,7 @@ extern "C" {
  * A single vfio-user DMA region is one 2 MiB hugepage, and the target maps each
  * region independently — so a single NVMe SGL data-block descriptor must not
  * cross a 2 MiB region boundary. A large value is therefore described by one
- * region-bounded data block per 2 MiB region (the same shape as the raw client's
- * nvfu_sgl_set_dptr). The number of regions is bounded by the target's
+ * region-bounded data block per 2 MiB region. The number of regions is bounded by the target's
  * NVMF_REQ_MAX_BUFFERS = SPDK_NVMF_MAX_SGL_ENTRIES*2+1 = 33, capping a single
  * KV op at ~64 MiB.
  *

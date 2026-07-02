@@ -431,7 +431,7 @@ spdk_kv_shim_max_value_len_op(const struct spdk_kv_shim *sh)
  * buffer of \c len bytes starting at \c base — i.e. the count of segments
  * kv_next_sge() will yield. A segment never crosses a 2 MiB boundary, so the
  * first segment runs from \c base to the next region boundary and the rest are
- * full regions (last possibly short). Mirrors nvfu_sgl_set_dptr's nseg formula.
+ * full regions (last possibly short).
  */
 static uint32_t
 kv_region_count(const void *base, uint32_t len)

@@ -77,7 +77,7 @@ failure returns an error status (never masked as a miss).
   (`spdk_nvme_kv_store` / `spdk_nvme_kv_retrieve` in `include/spdk/nvme_kv.h`)
   over a controller attached with `spdk_nvme_probe`. SPDK's transport layer is
   what makes the datapath transport-agnostic for free (VFIOUSER now, PCIE
-  later). This is why the plugin does **not** reuse the raw `nkv_vfu` client.
+  later). This is why the plugin does **not** carry a bespoke raw vfio-user client.
 - **Own generic shim.** The C++ backend talks to a small, self-contained C shim
   (`spdk_kv_shim.{h,c}`) compiled into its own static lib. This isolates the
   C-only SPDK headers from the C++ TUs and keeps the plugin free of any external
@@ -111,8 +111,7 @@ region** (no vendor extension). The shim hands `lib/nvme` one 2 MiB-bounded
 segment at a time via the SGL iterator (`spdk_nvme_ctrlr_cmd_iov_raw_with_md`)
 and **disables the PCIe SGL merge** so each segment becomes its own descriptor —
 the vfio-user target maps each 2 MiB region independently, so a single descriptor
-must **not** cross a region boundary. This is the same shape as the raw client's
-`nvfu_sgl_set_dptr`. The descriptor count is bounded by the target's
+must **not** cross a region boundary. The descriptor count is bounded by the target's
 `NVMF_REQ_MAX_BUFFERS` (`SPDK_NVMF_MAX_SGL_ENTRIES*2+1 = 33`), which caps a
 single op at ~64 MiB (matching the vfio-user target's default `max_io_size`).
 
