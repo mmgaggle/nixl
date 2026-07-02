@@ -126,10 +126,14 @@ struct spdk_kv_shim_opts {
 	const char	*name;
 	/**
 	 * SPDK transport ID string, parsed with spdk_nvme_transport_id_parse().
-	 * The supported form is
-	 *   "trtype:VFIOUSER traddr:<socket-directory>".
-	 * The generic form ("trtype:PCIE traddr:<BDF>") is accepted by the
-	 * parser but only VFIOUSER is currently exercised.
+	 * The datapath is transport-agnostic: the same open/probe/attach/bind path
+	 * drives either
+	 *   "trtype:VFIOUSER traddr:<socket-directory>"  (an SPDK vfio-user target)
+	 * or
+	 *   "trtype:PCIE traddr:<BDF>"                    (a real NVMe controller
+	 *                                                  bound to vfio-pci),
+	 * selected purely by this string with no code fork. PCIE device-mode is
+	 * exercised by run_block_pcie.sh against a scratch NVMe namespace.
 	 */
 	const char	*transport_id;
 	/**

@@ -41,12 +41,14 @@ In:
 - **16-byte inline keys**, taken **verbatim** (opaque; no lineage parsing).
 - **Small AND large values** (up to ~64 MiB) in **host DRAM**, large ones
   carried by a **region-bounded SGL** (see below). **No striping.**
-- Connect via a **standard SPDK transport ID** (`trtype:VFIOUSER traddr:<sock>`).
+- Connect via a **standard SPDK transport ID** — either
+  `trtype:VFIOUSER traddr:<sock>` (an SPDK vfio-user target) or
+  `trtype:PCIE traddr:<BDF>` (a real NVMe controller via `vfio-pci`). The
+  transport is chosen **purely by the config string**, with **no code fork**.
 
 Out:
 - VRAM / P2PDMA.
 - Delete/List, as needed.
-- Device-mode (`PCIE`) transport parity.
 - KV **Exec** and **long keys** — permanently out of scope for this generic
   plugin.
 
@@ -192,3 +194,68 @@ only the NVMe-KV *host* driver.
 ```bash
 SPDK_ROOT=/path/to/spdk ./run_roundtrip.sh
 ```
+
+`run_block_roundtrip.sh` stands up an `nvmf_tgt` with an **NVM (block)**
+namespace backed by a `malloc` bdev over VFIOUSER and runs the **block**
+round-trip test (`spdk_kv_block_roundtrip_test`): write DRAM patterns to LBA
+ranges (4 KiB…~60 MiB), read them back byte-exact, and confirm the misaligned,
+over-single-op-bound, and out-of-capacity guards reject cleanly.
+
+```bash
+SPDK_ROOT=/path/to/spdk ./run_block_roundtrip.sh
+```
+
+### Device-mode (`PCIE`) testing
+
+The block datapath is transport-agnostic, so the **same** block round-trip runs
+against a **real local NVMe controller** over the `PCIE` transport — selected
+purely by the transport-ID string (`trtype:PCIE traddr:<BDF>`), **no code fork**.
+`run_block_pcie.sh` is the device-mode harness:
+
+```bash
+PCI_BDF=0000:xx:00.0 BIND=1 ./run_block_pcie.sh
+```
+
+> **DESTRUCTIVE — scratch device only.** This **WRITES LBAs (including LBA 0)**
+> on the device at `PCI_BDF`, overwriting any partition table / filesystem /
+> data. Point `PCI_BDF` at a **dedicated scratch** NVMe device or namespace
+> **only**; never a device holding data.
+
+The runner **fails safe** — before any bind or write it validates `PCI_BDF` and
+**refuses** (non-zero exit, nothing touched) unless the target is a safe scratch
+NVMe:
+
+- the PCI device must **exist** and be an **NVMe controller** (class `0x0108xx`);
+- any of its kernel block namespaces (or partitions) that is **mounted** or holds
+  the **root filesystem** is refused **unconditionally** (`FORCE` cannot override);
+- a namespace carrying a recognized **filesystem/partition signature** is refused
+  **unless `FORCE=1`** — a truly blank scratch device passes without `FORCE`; a
+  device you *intend* to overwrite needs `FORCE=1`. (This also covers a whole-disk
+  filesystem with no partition table.)
+
+It also requires an explicit `PCI_BDF` (never guesses), makes you type the BDF
+back to confirm (skip with `ASSUME_YES=1` for non-interactive runs), and after a
+`BIND=1` bind **asserts** the target actually landed on `vfio-pci` before writing.
+
+To deliberately overwrite a device that has an existing signature:
+
+```bash
+PCI_BDF=0000:xx:00.0 BIND=1 FORCE=1 ./run_block_pcie.sh
+```
+
+Host requirements:
+
+- **IOMMU enabled** (`intel_iommu=on`, or `amd_iommu=on iommu=pt`). The shim's
+  SPDK env uses `no_huge` (DPDK IOVA=VA), so a `vfio-pci`-bound controller can
+  only DMA through an IOMMU. Check `/sys/kernel/iommu_groups/` is non-empty.
+- The scratch controller **bound to `vfio-pci`**. `BIND=1` binds it for you,
+  scoped to just that BDF via `PCI_ALLOWED` (SPDK `scripts/setup.sh`), so no
+  other NVMe controller — e.g. your boot drive — is touched. The vars are passed
+  through `sudo env` so a hardened sudoers (`env_reset`) cannot strip
+  `PCI_ALLOWED` and turn the scoped bind into a bind-everything. Equivalent
+  manual bind:
+  ```bash
+  sudo env PCI_ALLOWED="$PCI_BDF" HUGEMEM=64 /path/to/spdk/scripts/setup.sh
+  # hand it back to the kernel afterwards:
+  sudo env PCI_ALLOWED="$PCI_BDF" /path/to/spdk/scripts/setup.sh reset
+  ```
