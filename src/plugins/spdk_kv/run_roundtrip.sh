@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Brings up an SPDK nvmf target with an in-memory KV namespace (kvdev_mem, no
-# Ceph) over VFIOUSER, then runs the SPDK_KV direct-engine round-trip test
+# Ceph) over VFIOUSER, then runs the SPDK direct-engine round-trip test
 # against it. Stores small AND large values (up to ~64 MiB, via the
 # region-bounded SGL) under 16-byte keys and Retrieves them back byte-exact, and
 # checks an over-bound value is cleanly rejected (not striped).

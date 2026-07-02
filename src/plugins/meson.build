@@ -140,7 +140,7 @@ if enabled_plugins.get('GPUNETIO')
     endif
 endif
 
-if enabled_plugins.get('SPDK_KV')
+if enabled_plugins.get('SPDK')
     subdir('spdk_kv')
 endif
 

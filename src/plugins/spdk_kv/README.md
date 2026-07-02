@@ -15,7 +15,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# NIXL Generic SPDK NVMe-KV Plugin (`SPDK_KV`)
+# NIXL Generic SPDK NVMe-KV Plugin (`SPDK`)
 
 A clean-sheet, **transport-agnostic** and **backend-agnostic** NIXL backend that
 speaks the **ratified NVMe Key-Value command set** over the SPDK NVMe driver
@@ -157,10 +157,10 @@ skipped automatically if they are absent. It ships its own shim, so
 
 ```bash
 meson setup builddir \
-    -Denable_plugins=SPDK_KV \
+    -Denable_plugins=SPDK \
     -Dspdk_root=/path/to/spdk \
     -Dspdk_kv_build_test=true
-ninja -C builddir src/plugins/spdk_kv/libplugin_SPDK_KV.so \
+ninja -C builddir src/plugins/spdk_kv/libplugin_SPDK.so \
                   src/plugins/spdk_kv/spdk_kv_roundtrip_test
 ```
 

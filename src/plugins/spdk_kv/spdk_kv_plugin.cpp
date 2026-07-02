@@ -25,17 +25,17 @@ using spdk_kv_plugin_t = nixlBackendPluginCreator<nixlSpdkKvEngine>;
 // Local host DRAM source, remote OBJ-style key-addressed destination.
 static const nixl_mem_list_t supported_segments = {DRAM_SEG, OBJ_SEG};
 
-#ifdef STATIC_PLUGIN_SPDK_KV
+#ifdef STATIC_PLUGIN_SPDK
 nixlBackendPlugin *
-createStaticSPDK_KVPlugin() {
+createStaticSPDKPlugin() {
     return spdk_kv_plugin_t::create(
-        NIXL_PLUGIN_API_VERSION, "SPDK_KV", "0.1.0", {}, supported_segments);
+        NIXL_PLUGIN_API_VERSION, "SPDK", "0.1.0", {}, supported_segments);
 }
 #else
 extern "C" NIXL_PLUGIN_EXPORT nixlBackendPlugin *
 nixl_plugin_init() {
     return spdk_kv_plugin_t::create(
-        NIXL_PLUGIN_API_VERSION, "SPDK_KV", "0.1.0", {}, supported_segments);
+        NIXL_PLUGIN_API_VERSION, "SPDK", "0.1.0", {}, supported_segments);
 }
 
 extern "C" NIXL_PLUGIN_EXPORT void

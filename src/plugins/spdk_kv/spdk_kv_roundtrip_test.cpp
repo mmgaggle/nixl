@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
- * Direct-engine round-trip test for the generic SPDK_KV backend (Store /
+ * Direct-engine round-trip test for the generic SPDK backend (Store /
  * Retrieve, Exist, value auto-sizing, and large values).
  *
  * Instantiates nixlSpdkKvEngine directly (no nixlAgent), registers a DRAM
@@ -157,7 +157,7 @@ main(int argc, char **argv) {
 
     nixlBackendInitParams init{};
     init.localAgent = "spdk_kv_test_agent";
-    init.type = "SPDK_KV";
+    init.type = "SPDK";
     init.customParams = &params;
     init.enableProgTh = false;
     init.pthrDelay = 0;

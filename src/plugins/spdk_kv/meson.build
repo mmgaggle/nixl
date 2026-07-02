@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # ---------------------------------------------------------------------------
-# SPDK_KV plugin: a clean-sheet, transport-agnostic, backend-agnostic NIXL
+# SPDK plugin: a clean-sheet, transport-agnostic, backend-agnostic NIXL
 # backend that speaks the ratified NVMe Key-Value command set over the SPDK
 # NVMe driver (lib/nvme). WRITE -> KV Store, READ -> KV Retrieve. It ships its
 # OWN generic host shim (spdk_kv_shim.{h,c}); it does NOT depend on any external
@@ -23,7 +23,7 @@
 
 # The top-level project() declares only C++ (and optionally CUDA); it does NOT
 # enable the C language. This plugin compiles its own C shim (spdk_kv_shim.c),
-# so enable the host C compiler here. This keeps SPDK_KV self-contained: it does
+# so enable the host C compiler here. This keeps the SPDK plugin self-contained: it does
 # not rely on another plugin having flipped the project languages to include C.
 # add_languages is idempotent, so this is a no-op if C was already enabled by a
 # co-built plugin or the top-level project.
@@ -43,11 +43,11 @@ vfu_lib = spdk_root / 'build' / 'libvfio-user' / 'usr' / 'local' / 'lib'
 # The plugin is gated on the prebuilt SPDK NVMe library (which carries the KV
 # command set) and the KV public header. Skip cleanly when they are absent.
 if not fs.exists(spdk_build_lib / 'libspdk_nvme.a')
-    warning('SPDK_KV plugin disabled: SPDK nvme lib not found under ' + spdk_build_lib)
+    warning('SPDK plugin disabled: SPDK nvme lib not found under ' + spdk_build_lib)
     subdir_done()
 endif
 if not fs.exists(spdk_inc / 'spdk' / 'nvme_kv.h')
-    warning('SPDK_KV plugin disabled: spdk/nvme_kv.h not found under ' + spdk_inc)
+    warning('SPDK plugin disabled: spdk/nvme_kv.h not found under ' + spdk_inc)
     subdir_done()
 endif
 
@@ -131,9 +131,9 @@ spdk_kv_sources = [
 plugin_deps = [nixl_infra, nixl_common_dep]
 spdk_kv_inc = [nixl_inc_dirs, utils_inc_dirs, spdk_kv_local_inc, spdk_kv_spdk_inc]
 
-if 'SPDK_KV' in static_plugins
+if 'SPDK' in static_plugins
     spdk_kv_backend_lib = static_library(
-        'SPDK_KV',
+        'SPDK',
         spdk_kv_sources,
         dependencies: plugin_deps,
         link_with: spdk_kv_shim_lib,
@@ -143,7 +143,7 @@ if 'SPDK_KV' in static_plugins
         name_prefix: 'libplugin_')
 else
     spdk_kv_backend_lib = shared_library(
-        'SPDK_KV',
+        'SPDK',
         spdk_kv_sources,
         dependencies: plugin_deps,
         link_with: spdk_kv_shim_lib,
@@ -156,13 +156,13 @@ else
         install_rpath: '$ORIGIN/..')
     if get_option('buildtype') == 'debug'
         run_command('sh', '-c',
-            'echo "SPDK_KV=' + spdk_kv_backend_lib.full_path() + '" >> ' + plugin_build_dir + '/pluginlist',
+            'echo "SPDK=' + spdk_kv_backend_lib.full_path() + '" >> ' + plugin_build_dir + '/pluginlist',
             check: true
         )
     endif
 endif
 
-if 'SPDK_KV' in static_plugins
+if 'SPDK' in static_plugins
     spdk_kv_backend_interface = declare_dependency(link_whole: spdk_kv_backend_lib)
 else
     spdk_kv_backend_interface = declare_dependency(link_with: spdk_kv_backend_lib)
