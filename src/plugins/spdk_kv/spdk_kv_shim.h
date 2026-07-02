@@ -102,6 +102,19 @@ extern "C" {
 struct spdk_kv_shim;
 
 /**
+ * Namespace kind to bind (ratified option (b): ONE namespace per engine,
+ * whose command set is chosen by an init param). One controller may present
+ * both a KV and a block namespace; an agent that needs both opens two shims.
+ */
+enum spdk_kv_shim_ns_kind {
+	/** Bind a CSI==KV namespace; enables Store/Retrieve/Exist.
+	 *  This is 0 so a zero-initialized opts keeps the historical KV behavior. */
+	SPDK_KV_SHIM_NS_KIND_KV = 0,
+	/** Bind a CSI==NVM (block) namespace; enables LBA read/write. */
+	SPDK_KV_SHIM_NS_KIND_BLOCK = 1,
+};
+
+/**
  * Size-versioned open options. Callers MUST set \c opts_size to
  * sizeof(struct spdk_kv_shim_opts) before calling spdk_kv_shim_open() so the
  * shim can stay ABI-compatible as fields are added.
@@ -119,7 +132,10 @@ struct spdk_kv_shim_opts {
 	 * parser but only VFIOUSER is currently exercised.
 	 */
 	const char	*transport_id;
-	/** Namespace id to bind; 0 selects the first CSI==KV namespace. */
+	/**
+	 * Namespace id to bind; 0 selects the first namespace matching \c ns_kind.
+	 * When nonzero the requested namespace must itself be of that kind.
+	 */
 	uint32_t	nsid;
 	/**
 	 * When true, the shim calls spdk_env_init() in open() and
@@ -137,6 +153,13 @@ struct spdk_kv_shim_opts {
 	 * env) may be opened/closed repeatedly.
 	 */
 	bool		init_env;
+	/**
+	 * Which namespace kind to bind (option (b), one namespace per engine).
+	 * SPDK_KV_SHIM_NS_KIND_KV (the 0 default) preserves the historical KV
+	 * datapath; SPDK_KV_SHIM_NS_KIND_BLOCK binds a CSI==NVM namespace and
+	 * enables spdk_kv_shim_read()/spdk_kv_shim_write().
+	 */
+	enum spdk_kv_shim_ns_kind ns_kind;
 };
 
 /**
@@ -162,7 +185,16 @@ void spdk_kv_shim_close(struct spdk_kv_shim *sh);
 /** Allocate a DMA-capable buffer of \c len bytes (zeroed). NULL on failure. */
 void *spdk_kv_shim_dma_alloc(size_t len);
 
-/** Free a buffer returned by spdk_kv_shim_dma_alloc(). Safe with NULL. */
+/**
+ * Allocate a DMA-capable buffer of \c len bytes (zeroed) aligned to \c align
+ * bytes (a power of two). NULL on failure. The block datapath aligns its
+ * single-range staging buffer to a 2 MiB DMA region (SPDK_KV_SHIM_DMA_REGION)
+ * so a transfer up to one region never straddles two independently-mapped
+ * vfio-user regions; the multi-region SGL block path is a later slice.
+ */
+void *spdk_kv_shim_dma_alloc_aligned(size_t len, size_t align);
+
+/** Free a buffer returned by spdk_kv_shim_dma_alloc[_aligned](). Safe with NULL. */
 void spdk_kv_shim_dma_free(void *buf);
 
 /** Maximum value length (kvvml) advertised by the bound KV namespace. */
@@ -226,6 +258,46 @@ int spdk_kv_shim_retrieve(struct spdk_kv_shim *sh, const void *key, uint8_t key_
  * errno for submit-/transport-level errors -- per the return convention above.
  */
 int spdk_kv_shim_exist(struct spdk_kv_shim *sh, const void *key, uint8_t key_len);
+
+/* --------------------------------------------------------------------------
+ * Block (CSI==NVM) datapath.
+ *
+ * Available only on a shim opened with ns_kind == SPDK_KV_SHIM_NS_KIND_BLOCK.
+ * Addressing is by LBA (sector), not by key: the caller converts a byte length
+ * to an LBA count using spdk_kv_shim_sector_size() and bounds the range with
+ * spdk_kv_shim_num_sectors(). SINGLE contiguous DMA range per op (this slice);
+ * the region-bounded SGL block path is a later slice.
+ * ------------------------------------------------------------------------ */
+
+/** Logical block (sector) size in bytes of the bound block namespace, or 0 if
+ *  the shim is not block-bound. */
+uint32_t spdk_kv_shim_sector_size(const struct spdk_kv_shim *sh);
+
+/** Number of logical blocks (sectors) in the bound block namespace, or 0 if
+ *  the shim is not block-bound. LBA + lba_count must stay <= this. */
+uint64_t spdk_kv_shim_num_sectors(const struct spdk_kv_shim *sh);
+
+/**
+ * Block write: copy \c lba_count sectors from the DMA-capable \c buf to the
+ * namespace starting at \c lba (spdk_nvme_ns_cmd_write). \c buf must come from
+ * spdk_kv_shim_dma_alloc[_aligned](). \c lba_count must be nonzero and
+ * [\c lba, \c lba + lba_count) must stay within spdk_kv_shim_num_sectors().
+ *
+ * \return per the return convention documented at the top of this header
+ *         (0 on success; -EINVAL on a bad/out-of-range request; -ENXIO etc.).
+ */
+int spdk_kv_shim_write(struct spdk_kv_shim *sh, const void *buf, uint64_t lba,
+		       uint32_t lba_count);
+
+/**
+ * Block read: copy \c lba_count sectors from the namespace starting at \c lba
+ * into the DMA-capable \c buf (spdk_nvme_ns_cmd_read). Same buffer/bounds rules
+ * as spdk_kv_shim_write().
+ *
+ * \return per the return convention documented at the top of this header.
+ */
+int spdk_kv_shim_read(struct spdk_kv_shim *sh, void *buf, uint64_t lba,
+		      uint32_t lba_count);
 
 #ifdef __cplusplus
 }

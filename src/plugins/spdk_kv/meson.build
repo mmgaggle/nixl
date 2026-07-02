@@ -168,12 +168,23 @@ else
     spdk_kv_backend_interface = declare_dependency(link_with: spdk_kv_backend_lib)
 endif
 
-# Direct-engine round-trip test (links the engine TUs + shim against a live SPDK
-# KV target). Enabled by -Dspdk_kv_build_test=true.
+# Direct-engine round-trip tests (link the engine TUs + shim against a live SPDK
+# target). Enabled by -Dspdk_kv_build_test=true. The KV test drives the OBJ_SEG
+# Store/Retrieve path; the block test drives the BLK_SEG LBA read/write path.
 if get_option('spdk_kv_build_test')
     executable(
         'spdk_kv_roundtrip_test',
         ['spdk_kv_roundtrip_test.cpp', 'spdk_kv_backend.cpp', 'spdk_kv_backend.h',
+         'spdk_kv_key.cpp', 'spdk_kv_key.h'],
+        dependencies: plugin_deps,
+        link_with: spdk_kv_shim_lib,
+        link_args: spdk_link_args,
+        include_directories: spdk_kv_inc,
+        install: false,
+    )
+    executable(
+        'spdk_kv_block_roundtrip_test',
+        ['spdk_kv_block_roundtrip_test.cpp', 'spdk_kv_backend.cpp', 'spdk_kv_backend.h',
          'spdk_kv_key.cpp', 'spdk_kv_key.h'],
         dependencies: plugin_deps,
         link_with: spdk_kv_shim_lib,

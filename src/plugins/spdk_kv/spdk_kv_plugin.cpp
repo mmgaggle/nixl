@@ -22,8 +22,9 @@
 // Plugin type alias for convenience.
 using spdk_kv_plugin_t = nixlBackendPluginCreator<nixlSpdkKvEngine>;
 
-// Local host DRAM source, remote OBJ-style key-addressed destination.
-static const nixl_mem_list_t supported_segments = {DRAM_SEG, OBJ_SEG};
+// Local host DRAM source; remote is an OBJ-style key-addressed KV blob (OBJ_SEG)
+// or an NVMe block LBA range (BLK_SEG). The op-set is chosen by the remote type.
+static const nixl_mem_list_t supported_segments = {DRAM_SEG, OBJ_SEG, BLK_SEG};
 
 #ifdef STATIC_PLUGIN_SPDK
 nixlBackendPlugin *

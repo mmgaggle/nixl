@@ -54,10 +54,24 @@ struct spdk_kv_shim;
  * Memory-type mapping (storage-backend shape, mirrors OBJ):
  *   - local  source/destination : DRAM_SEG (host DRAM)
  *   - remote key-addressed blob  : OBJ_SEG (the NVMe-KV key space)
+ *   - remote LBA range           : BLK_SEG (an NVMe NVM/block namespace)
+ *
+ * One plugin, an LBA/KV knob: the op-set is chosen by the REMOTE memory type
+ * per transfer. OBJ_SEG drives the KV path above; BLK_SEG drives an NVMe block
+ * (LBA read/write) path against a CSI==NVM namespace. The block namespace is
+ * bound at init by the "csi=block" (a.k.a. ns_kind/mode=block) param -- ratified
+ * option (b), one namespace kind per engine; an agent that needs both KV and
+ * block opens two engines. For BLK_SEG the remote descriptor's addr is the
+ * starting LBA and devId is the namespace; there is NO key derivation and NO
+ * value auto-sizing (a block read/write moves exactly len bytes). This slice
+ * carries a SINGLE contiguous DMA range per op; the region-bounded SGL for large
+ * block ranges is a later slice.
  *
  * Operation mapping:
- *   - NIXL_WRITE (local DRAM -> remote) becomes a KV Store
- *   - NIXL_READ  (remote -> local DRAM) becomes a KV Retrieve
+ *   - NIXL_WRITE (local DRAM -> remote OBJ) becomes a KV Store
+ *   - NIXL_READ  (remote OBJ -> local DRAM) becomes a KV Retrieve
+ *   - NIXL_WRITE (local DRAM -> remote BLK) becomes an NVMe block write
+ *   - NIXL_READ  (remote BLK -> local DRAM) becomes an NVMe block read
  *
  * The remote OBJ_SEG descriptor carries the NIXL block identifier in its
  * metaInfo blob. The engine takes those bytes VERBATIM as the NVMe-KV key
@@ -176,11 +190,38 @@ private:
     // Ratified maximum NVMe-KV inline key length (bytes).
     static constexpr uint8_t kMaxKeyLen = 16;
 
+    // Block (BLK_SEG) helpers. Dispatched from prep/postXfer when the remote
+    // memory type is BLK_SEG; the OBJ_SEG (KV) path is unchanged.
+    //
+    // computeBlockRange: derive the LBA (remote.addr) and sector count for one
+    // descriptor pair, enforcing the block semantics -- local/remote byte
+    // lengths must match, the length must be a multiple of the namespace sector
+    // size, a single op stays within one DMA region (SINGLE-range slice), and
+    // [LBA, LBA+nlba) must fit the namespace capacity. A zero-length descriptor
+    // yields nlba_out == 0 (a no-op the caller skips). Returns
+    // NIXL_ERR_INVALID_PARAM on any violation.
+    nixl_status_t
+    computeBlockRange(const nixlMetaDesc &local_desc,
+                      const nixlMetaDesc &remote_desc,
+                      uint64_t &lba_out,
+                      uint32_t &nlba_out) const;
+
+    // postXferBlock: stage through a region-aligned SPDK DMA buffer and issue
+    // spdk_kv_shim_write (WRITE) / spdk_kv_shim_read (READ) per descriptor.
+    nixl_status_t
+    postXferBlock(const nixl_xfer_op_t &operation,
+                  const nixl_meta_dlist_t &local,
+                  const nixl_meta_dlist_t &remote,
+                  nixlBackendReqH *handle) const;
+
     // The SPDK KV shim handle (owns the controller attach + qpair).
     spdk_kv_shim *shim_ = nullptr;
 
     // Effective key length: min(kMaxKeyLen, kvkml advertised by the namespace).
     uint8_t maxKeyLen_ = kMaxKeyLen;
+
+    // True when the shim bound a CSI==NVM block namespace (csi=block init param).
+    bool blockMode_ = false;
 };
 
 #endif // SPDK_KV_BACKEND_H

@@ -47,9 +47,14 @@ struct spdk_kv_shim {
 	struct spdk_nvme_ctrlr	*ctrlr;
 	struct spdk_nvme_ns	*ns;
 	struct spdk_nvme_qpair	*qpair;
-	/* Cached KV namespace capabilities. */
+	/* Bound namespace kind (option (b): one kind per shim). */
+	bool			is_block;
+	/* Cached KV namespace capabilities (KV shim). */
 	uint32_t		kvvml;	/* max value length */
 	uint32_t		kvkml;	/* max key length */
+	/* Cached block namespace capabilities (block shim). */
+	uint32_t		sector_size;	/* logical block size (bytes) */
+	uint64_t		num_sectors;	/* namespace capacity (sectors) */
 	/* Whether this shim owns the SPDK env (called spdk_env_init). */
 	bool			owns_env;
 	/*
@@ -154,6 +159,7 @@ spdk_kv_shim_open(const struct spdk_kv_shim_opts *opts, struct spdk_kv_shim **ou
 	struct spdk_kv_shim *sh;
 	struct spdk_nvme_transport_id trid = {};
 	const struct spdk_nvme_kv_ns_data *kv_ns_data;
+	enum spdk_nvme_csi want_csi;
 	uint32_t nsid;
 	int rc;
 
@@ -208,11 +214,20 @@ spdk_kv_shim_open(const struct spdk_kv_shim_opts *opts, struct spdk_kv_shim **ou
 		goto err_detach;
 	}
 
-	/* Bind the requested namespace, or the first CSI==KV ns when nsid==0. */
+	/*
+	 * Bind ONE namespace whose command set is chosen by ns_kind (option (b)):
+	 * KV -> CSI==KV, BLOCK -> CSI==NVM. The mem-type dispatch in the backend
+	 * still selects the op per transfer; ns_kind only scopes which namespace
+	 * this shim binds.
+	 */
+	sh->is_block = (opts->ns_kind == SPDK_KV_SHIM_NS_KIND_BLOCK);
+	want_csi = sh->is_block ? SPDK_NVME_CSI_NVM : SPDK_NVME_CSI_KV;
+
+	/* Bind the requested namespace, or the first ns of the wanted CSI when nsid==0. */
 	if (opts->nsid != 0) {
 		struct spdk_nvme_ns *ns = spdk_nvme_ctrlr_get_ns(sh->ctrlr, opts->nsid);
 
-		if (ns != NULL && spdk_nvme_ns_get_csi(ns) == SPDK_NVME_CSI_KV) {
+		if (ns != NULL && spdk_nvme_ns_get_csi(ns) == want_csi) {
 			sh->ns = ns;
 		}
 	} else {
@@ -220,7 +235,7 @@ spdk_kv_shim_open(const struct spdk_kv_shim_opts *opts, struct spdk_kv_shim **ou
 		     nsid = spdk_nvme_ctrlr_get_next_active_ns(sh->ctrlr, nsid)) {
 			struct spdk_nvme_ns *ns = spdk_nvme_ctrlr_get_ns(sh->ctrlr, nsid);
 
-			if (ns != NULL && spdk_nvme_ns_get_csi(ns) == SPDK_NVME_CSI_KV) {
+			if (ns != NULL && spdk_nvme_ns_get_csi(ns) == want_csi) {
 				sh->ns = ns;
 				break;
 			}
@@ -232,19 +247,30 @@ spdk_kv_shim_open(const struct spdk_kv_shim_opts *opts, struct spdk_kv_shim **ou
 		goto err_detach;
 	}
 
-	kv_ns_data = spdk_nvme_kv_ns_get_data(sh->ns);
-	if (kv_ns_data == NULL) {
-		rc = -EPROTO;
-		goto err_detach;
-	}
-	/*
-	 * A KV namespace can advertise up to 16 formats; the ACTIVE one is
-	 * selected by kvfc.kvfi (4-bit), so read the key/value max lengths from
-	 * kvf[kvfc.kvfi], NOT kvf[0]. (Matches SPDK's own canonical reader in
-	 * app/spdk_nvme_perf/perf.c.) kvfi is 4 bits and kvf[] has 16 entries,
-	 * so the index is always in bounds.
-	 */
-	{
+	if (sh->is_block) {
+		/*
+		 * Block namespace: cache the sector geometry the datapath needs to
+		 * turn a byte length into an LBA count and to bounds-check a range.
+		 */
+		sh->sector_size = spdk_nvme_ns_get_sector_size(sh->ns);
+		sh->num_sectors = spdk_nvme_ns_get_num_sectors(sh->ns);
+		if (sh->sector_size == 0) {
+			rc = -EPROTO;
+			goto err_detach;
+		}
+	} else {
+		kv_ns_data = spdk_nvme_kv_ns_get_data(sh->ns);
+		if (kv_ns_data == NULL) {
+			rc = -EPROTO;
+			goto err_detach;
+		}
+		/*
+		 * A KV namespace can advertise up to 16 formats; the ACTIVE one is
+		 * selected by kvfc.kvfi (4-bit), so read the key/value max lengths from
+		 * kvf[kvfc.kvfi], NOT kvf[0]. (Matches SPDK's own canonical reader in
+		 * app/spdk_nvme_perf/perf.c.) kvfi is 4 bits and kvf[] has 16 entries,
+		 * so the index is always in bounds.
+		 */
 		uint8_t kvfi = kv_ns_data->kvfc.kvfi;
 
 		sh->kvkml = kv_ns_data->kvf[kvfi].kvkml;
@@ -312,10 +338,28 @@ spdk_kv_shim_dma_alloc(size_t len)
 	return spdk_dma_zmalloc(len, 0, NULL);
 }
 
+void *
+spdk_kv_shim_dma_alloc_aligned(size_t len, size_t align)
+{
+	return spdk_dma_zmalloc(len, align, NULL);
+}
+
 void
 spdk_kv_shim_dma_free(void *buf)
 {
 	spdk_dma_free(buf);
+}
+
+uint32_t
+spdk_kv_shim_sector_size(const struct spdk_kv_shim *sh)
+{
+	return (sh != NULL && sh->is_block) ? sh->sector_size : 0;
+}
+
+uint64_t
+spdk_kv_shim_num_sectors(const struct spdk_kv_shim *sh)
+{
+	return (sh != NULL && sh->is_block) ? sh->num_sectors : 0;
 }
 
 uint32_t
@@ -546,4 +590,63 @@ spdk_kv_shim_exist(struct spdk_kv_shim *sh, const void *key, uint8_t key_len)
 	 * value data is transferred either way.
 	 */
 	return status_to_rc(sh);
+}
+
+/*
+ * Shared block read/write datapath. A SINGLE contiguous DMA range per op
+ * (spdk_nvme_ns_cmd_read/write build the PRP/SGL); the region-bounded SGL for
+ * multi-region block ranges is a later slice, so callers cap a single op at one
+ * DMA region and pass a region-aligned staging buffer. Reuses the same bounded
+ * poll loop and completion capture as the KV ops.
+ */
+static int
+blk_rw(struct spdk_kv_shim *sh, bool is_write, void *buf, uint64_t lba,
+       uint32_t lba_count)
+{
+	int rc;
+
+	if (sh == NULL || buf == NULL || lba_count == 0) {
+		return -EINVAL;
+	}
+	if (!sh->is_block || sh->sector_size == 0) {
+		return -EINVAL;
+	}
+	/*
+	 * Capacity guard: reject an out-of-range LBA range rather than submit it.
+	 * lba >= num_sectors is checked first so num_sectors - lba never underflows.
+	 */
+	if (lba >= sh->num_sectors || (uint64_t)lba_count > sh->num_sectors - lba) {
+		return -EINVAL;
+	}
+
+	sh->op_done = false;
+	if (is_write) {
+		rc = spdk_nvme_ns_cmd_write(sh->ns, sh->qpair, buf, lba, lba_count,
+					    io_complete, sh, 0);
+	} else {
+		rc = spdk_nvme_ns_cmd_read(sh->ns, sh->qpair, buf, lba, lba_count,
+					   io_complete, sh, 0);
+	}
+	if (rc != 0) {
+		return rc < 0 ? rc : -rc;
+	}
+	rc = poll_to_completion(sh);
+	if (rc != 0) {
+		return rc;
+	}
+	return status_to_rc(sh);
+}
+
+int
+spdk_kv_shim_write(struct spdk_kv_shim *sh, const void *buf, uint64_t lba,
+		   uint32_t lba_count)
+{
+	return blk_rw(sh, true, (void *)(uintptr_t)buf, lba, lba_count);
+}
+
+int
+spdk_kv_shim_read(struct spdk_kv_shim *sh, void *buf, uint64_t lba,
+		  uint32_t lba_count)
+{
+	return blk_rw(sh, false, buf, lba, lba_count);
 }
