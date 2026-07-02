@@ -273,6 +273,19 @@ nixlSpdkKvEngine::postXfer(const nixl_xfer_op_t &operation,
         const auto data_ptr = reinterpret_cast<void *>(local_desc.addr);
         const size_t data_len = local_desc.len;
 
+        // NO striping: a value larger than the single-op region-bounded SGL
+        // bound (~64 MiB) is out of scope and REJECTED here, before staging any
+        // DMA, rather than being split across ops. The KV-cache use case sizes
+        // its blocks (tokens_per_block) so one value = one op.
+        const uint32_t max_op = spdk_kv_shim_max_value_len_op(shim_);
+        if (data_len > max_op) {
+            NIXL_ERROR << "SPDK_KV: descriptor " << i << " length " << data_len
+                       << " exceeds the single-op bound " << max_op
+                       << " bytes; rejecting (no striping)";
+            req_h->status = NIXL_ERR_INVALID_PARAM;
+            return NIXL_ERR_INVALID_PARAM;
+        }
+
         // A zero-length descriptor carries no value bytes. Treat it as a
         // successful no-op rather than routing spdk_dma_zmalloc(0) (which may
         // return NULL) through the alloc-failure path and misreporting it as a

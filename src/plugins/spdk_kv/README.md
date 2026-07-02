@@ -27,8 +27,8 @@ SPDK KV backend.
 It carries **no backend-specific behavior, no KV Exec, and no long-key path** by
 design.
 
-This directory implements the **walking skeleton** plus **Exist (QUERY) and
-value auto-sizing**.
+This directory implements the **walking skeleton**, **Exist (QUERY) and value
+auto-sizing**, and **large values**.
 
 ## Scope
 
@@ -39,12 +39,12 @@ In:
   **TRUE value length** (completion `cdw0`) so the caller can **resize and
   re-Retrieve** instead of silently truncating.
 - **16-byte inline keys**, taken **verbatim** (opaque; no lineage parsing).
-- **Small/moderate values** in **host DRAM** (single staging buffer per op).
+- **Small AND large values** (up to ~64 MiB) in **host DRAM**, large ones
+  carried by a **region-bounded SGL** (see below). **No striping.**
 - Connect via a **standard SPDK transport ID** (`trtype:VFIOUSER traddr:<sock>`).
 
 Out:
 - VRAM / P2PDMA.
-- Large-value **region-bounded (multi-region) SGL** up to ~64 MiB.
 - Delete/List, as needed.
 - Device-mode (`PCIE`) transport parity.
 - KV **Exec** and **long keys** — permanently out of scope for this generic
@@ -95,12 +95,48 @@ failure returns an error status (never masked as a miss).
   TRUE stored length. Devices signal a short host buffer two ways — SUCCESS with
   `cdw0 > buf_len` (this KV target), or `0x85 INVALID_VALUE_SIZE` directly — and
   the shim **normalizes both** to a single `BUFFER_TOO_SMALL` (`0x85`) return
-  that reports the true length. The
-  backend then does **not** copy a truncated value; it records the true length
-  and reports `NIXL_ERR_MISMATCH`, so the caller resizes and re-Retrieves. The
-  true length is read back with `getReqTrueLen(handle, idx)`. This implements
-  the **optimistic-then-resize** strategy; a size-cache and a 2-RTT probe-first
-  variant are left for later.
+  that reports the true length. The backend then does **not** copy a truncated
+  value; it records the true length and reports `NIXL_ERR_MISMATCH`, so the
+  caller resizes and re-Retrieves. The true length is read back with
+  `getReqTrueLen(handle, idx)`. This implements the **optimistic-then-resize**
+  strategy; a size-cache and a 2-RTT probe-first variant are left for later.
+
+## Large values — region-bounded SGL, and why we do NOT stripe
+
+A value up to **~64 MiB** rides a **single KV op** described by a **region-bounded
+scatter-gather list**: one standard NVMe data-block descriptor per **2 MiB DMA
+region** (no vendor extension). The shim hands `lib/nvme` one 2 MiB-bounded
+segment at a time via the SGL iterator (`spdk_nvme_ctrlr_cmd_iov_raw_with_md`)
+and **disables the PCIe SGL merge** so each segment becomes its own descriptor —
+the vfio-user target maps each 2 MiB region independently, so a single descriptor
+must **not** cross a region boundary. This is the same shape as the raw client's
+`nvfu_sgl_set_dptr`. The descriptor count is bounded by the target's
+`NVMF_REQ_MAX_BUFFERS` (`SPDK_NVMF_MAX_SGL_ENTRIES*2+1 = 33`), which caps a
+single op at ~64 MiB (matching the vfio-user target's default `max_io_size`).
+
+**No striping — a hard design decision.** A value that would need more than the
+region budget is **rejected** (`NIXL_ERR_INVALID_PARAM`, before any DMA is
+staged), never split across ops. This is sound because a **KV-cache block's byte
+size is bounded and computable from model attributes**:
+
+```
+block_bytes = 2 (K,V) x n_layers x n_kv_heads x head_dim x dtype_bytes x tokens_per_block
+```
+
+For real models this lands in the low-MiB range (e.g. Llama-3-8B — GQA 8 KV
+heads, head_dim 128, fp16, 16-token block ≈ 2 MiB), comfortably inside the
+single-op SGL bound. So **one value = one op**: the caller sizes its blocks
+(`tokens_per_block`) so a block fits one op, and a value that genuinely exceeds
+the bound is out of scope for the KV-cache use case rather than something to
+chunk. The single-op bound is `SPDK_KV_SHIM_MAX_VALUE_LEN` (64 MiB), further
+clamped to the namespace-advertised `kvvml` when smaller.
+
+Note: the region-crossing protection is **load-bearing only for hugepage-backed
+DMA** (production), where each 2 MiB region is a separately-registered hugepage.
+The `--no-huge` test harness backs DMA with a single region, so the byte-exact
+large-value tests prove the SGL/iterator datapath end-to-end; the per-region
+descriptor split is built by construction and exercised there, but its
+*necessity* only manifests under hugepages.
 
 ## Custom backend parameters (`nixl_b_params_t`)
 
@@ -137,10 +173,16 @@ ninja -C builddir src/plugins/spdk_kv/libplugin_SPDK_KV.so \
 
 `run_roundtrip.sh` stands up an SPDK `nvmf_tgt` with an **in-memory** KV
 namespace (`kvdev_mem`, **no Ceph**) over VFIOUSER and runs the round-trip test:
-Store a small value under a 16-byte key, Retrieve it back, and verify
-byte-for-byte. It also checks the opaque key guards, **QUERY/Exist** (hit on a
-stored key, miss on an absent key), and **value auto-sizing** (a short-buffer
-READ reports the true length, then a correctly-sized READ returns byte-exact).
+Store a value under a 16-byte key, Retrieve it back, and verify byte-for-byte.
+It covers a small value, the opaque key guards, **QUERY/Exist** (hit on a stored
+key, miss on an absent key), **value auto-sizing** (a short-buffer READ reports
+the true length, then a correctly-sized READ returns byte-exact), **large
+values** at **1 MiB (1 region), 8 MiB (4 regions), and 60 MiB (30 regions)**, a
+**large-value auto-sizing** case (a too-small READ of a multi-region value
+reports the true length, then a resized re-Retrieve is byte-exact), and a **68
+MiB oversize value that must be cleanly rejected, not split**. The script raises
+the `kvdev_mem` `--max-value-len` so the target accepts the large stores (the
+host-side ~64 MiB region-bounded-SGL bound remains the effective limit).
 
 Note: the round-trip needs a **target-capable** KV SPDK build (one whose
 `nvmf_tgt` has the `kvdev_mem` module + KV nvmf namespace RPCs). Point

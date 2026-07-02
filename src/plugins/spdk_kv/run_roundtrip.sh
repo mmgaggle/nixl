@@ -4,8 +4,9 @@
 #
 # Brings up an SPDK nvmf target with an in-memory KV namespace (kvdev_mem, no
 # Ceph) over VFIOUSER, then runs the SPDK_KV direct-engine round-trip test
-# against it. Store a small value under a 16-byte key and Retrieve it back
-# byte-exact.
+# against it. Stores small AND large values (up to ~64 MiB, via the
+# region-bounded SGL) under 16-byte keys and Retrieves them back byte-exact, and
+# checks an over-bound value is cleanly rejected (not striped).
 #
 # Env overrides:
 #   SPDK_ROOT  (required) path to a target-capable NVMe-KV SPDK build. This
@@ -41,7 +42,9 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== starting nvmf_tgt =="
-"$SPDK_ROOT/build/bin/nvmf_tgt" -r "$rpc_sock" -m 0x1 --no-huge -s 512 &
+# -s 1024: headroom for mapping the client's up-to-~64 MiB DMA regions plus the
+# in-memory kvdev holding several large stored values simultaneously.
+"$SPDK_ROOT/build/bin/nvmf_tgt" -r "$rpc_sock" -m 0x1 --no-huge -s 1024 &
 nvmfpid=$!
 
 # Wait for the RPC socket to be ready.
@@ -52,7 +55,10 @@ done
 
 echo "== configuring in-memory KV namespace =="
 $rpc_py nvmf_create_transport -t VFIOUSER
-$rpc_py kvdev_mem_create "$kvdev_name"
+# Raise the kvdev value cap to 128 MiB so large-value stores (up to the plugin's
+# ~64 MiB single-op bound) are not rejected by the target's default 1 MiB cap.
+# The host-side ~64 MiB region-bounded-SGL bound is still the effective limit.
+$rpc_py kvdev_mem_create "$kvdev_name" --max-value-len $((128 * 1024 * 1024))
 $rpc_py nvmf_create_subsystem "$nqn" -s SPDKKV001 -a
 $rpc_py nvmf_subsystem_add_kv_ns "$nqn" "$kvdev_name"
 $rpc_py nvmf_subsystem_add_listener "$nqn" -t VFIOUSER -a "$muser_dir" -s 0

@@ -30,6 +30,7 @@
 #include "spdk/log.h"
 #include "spdk/nvme.h"
 #include "spdk/nvme_kv.h"
+#include "spdk/nvme_spec.h"
 
 #include "spdk_kv_shim.h"
 
@@ -70,6 +71,15 @@ struct spdk_kv_shim {
 	volatile uint8_t	op_sct;
 	volatile uint8_t	op_sc;
 	volatile uint32_t	op_cdw0;
+	/*
+	 * Region-bounded SGL iterator state for the in-flight op. lib/nvme drives
+	 * kv_reset_sgl()/kv_next_sge() (below) with this shim as the callback arg to
+	 * walk the value buffer one 2 MiB-region-bounded segment at a time. Single
+	 * in-flight op, single qpair, single thread — so one iterator suffices.
+	 */
+	const uint8_t		*sgl_base;
+	uint32_t		sgl_total;
+	uint32_t		sgl_off;
 };
 
 static bool
@@ -241,7 +251,23 @@ spdk_kv_shim_open(const struct spdk_kv_shim_opts *opts, struct spdk_kv_shim **ou
 		sh->kvvml = kv_ns_data->kvf[kvfi].kvvml;
 	}
 
-	sh->qpair = spdk_nvme_ctrlr_alloc_io_qpair(sh->ctrlr, NULL, 0);
+	{
+		/*
+		 * Disable the PCIe/vfio-user SGL merge so lib/nvme emits ONE SGL
+		 * data-block descriptor per region-bounded segment kv_next_sge()
+		 * yields (it would otherwise coalesce physically/IOVA-contiguous
+		 * segments into one descriptor). The vfio-user target maps each 2 MiB
+		 * DMA region independently, so a single descriptor must not span two
+		 * regions — merging IOVA-contiguous-but-separately-registered regions
+		 * would produce a region-crossing descriptor the target cannot map.
+		 * This yields the region-bounded SGL, matching the raw client.
+		 */
+		struct spdk_nvme_io_qpair_opts qopts;
+
+		spdk_nvme_ctrlr_get_default_io_qpair_opts(sh->ctrlr, &qopts, sizeof(qopts));
+		qopts.disable_pcie_sgl_merge = true;
+		sh->qpair = spdk_nvme_ctrlr_alloc_io_qpair(sh->ctrlr, &qopts, sizeof(qopts));
+	}
 	if (sh->qpair == NULL) {
 		rc = -ENOMEM;
 		goto err_detach;
@@ -304,40 +330,128 @@ spdk_kv_shim_max_key_len(const struct spdk_kv_shim *sh)
 	return sh ? sh->kvkml : 0;
 }
 
-int
-spdk_kv_shim_store(struct spdk_kv_shim *sh, const void *key, uint8_t key_len,
-		   const void *value, uint32_t value_len)
+uint32_t
+spdk_kv_shim_max_value_len_op(const struct spdk_kv_shim *sh)
 {
-	int rc;
+	uint32_t cap = SPDK_KV_SHIM_MAX_VALUE_LEN;
 
-	if (sh == NULL) {
-		return -EINVAL;
+	/* The region-bounded SGL bound (~64 MiB), further clamped to the
+	 * namespace-advertised max value length when that is smaller. kvvml==0
+	 * means "no advertised limit", so it does not lower the bound. */
+	if (sh != NULL && sh->kvvml != 0 && sh->kvvml < cap) {
+		cap = sh->kvvml;
 	}
-	sh->op_done = false;
-	rc = spdk_nvme_kv_store(sh->ns, sh->qpair, key, key_len, value, value_len,
-				io_complete, sh, 0);
-	if (rc != 0) {
-		return rc < 0 ? rc : -rc;
-	}
-	rc = poll_to_completion(sh);
-	if (rc != 0) {
-		return rc;
-	}
-	return status_to_rc(sh);
+	return cap;
 }
 
-int
-spdk_kv_shim_retrieve(struct spdk_kv_shim *sh, const void *key, uint8_t key_len,
-		      void *value, uint32_t buf_len, uint32_t *value_len_out)
+/*
+ * Number of 2 MiB-region-bounded data-block descriptors needed to describe a
+ * buffer of \c len bytes starting at \c base — i.e. the count of segments
+ * kv_next_sge() will yield. A segment never crosses a 2 MiB boundary, so the
+ * first segment runs from \c base to the next region boundary and the rest are
+ * full regions (last possibly short). Mirrors nvfu_sgl_set_dptr's nseg formula.
+ */
+static uint32_t
+kv_region_count(const void *base, uint32_t len)
 {
+	uint64_t addr = (uint64_t)(uintptr_t)base;
+	uint64_t first = SPDK_KV_SHIM_DMA_REGION - (addr & (SPDK_KV_SHIM_DMA_REGION - 1));
+
+	if (len == 0) {
+		return 0;
+	}
+	if ((uint64_t)len <= first) {
+		return 1;
+	}
+	return 1u + (uint32_t)(((uint64_t)len - first + SPDK_KV_SHIM_DMA_REGION - 1) /
+			       SPDK_KV_SHIM_DMA_REGION);
+}
+
+/* SGL iterator: restart the walk at \c offset (lib/nvme may re-drive it). */
+static void
+kv_reset_sgl(void *cb_arg, uint32_t offset)
+{
+	struct spdk_kv_shim *sh = cb_arg;
+
+	sh->sgl_off = offset;
+}
+
+/*
+ * SGL iterator: hand lib/nvme the next value segment, bounded so it never
+ * crosses a 2 MiB DMA-region boundary. With the qpair's SGL merge disabled,
+ * lib/nvme turns each segment into its own data-block descriptor — one per
+ * region — so no descriptor spans two independently-mapped target regions.
+ */
+static int
+kv_next_sge(void *cb_arg, void **address, uint32_t *length)
+{
+	struct spdk_kv_shim *sh = cb_arg;
+	uint64_t addr = (uint64_t)(uintptr_t)sh->sgl_base + sh->sgl_off;
+	uint32_t remaining = sh->sgl_total - sh->sgl_off;
+	uint32_t to_boundary =
+		(uint32_t)(SPDK_KV_SHIM_DMA_REGION - (addr & (SPDK_KV_SHIM_DMA_REGION - 1)));
+	uint32_t seg = remaining < to_boundary ? remaining : to_boundary;
+
+	*address = (void *)(uintptr_t)addr;
+	*length = seg;
+	sh->sgl_off += seg;
+	return 0;
+}
+
+/*
+ * Shared Store/Retrieve datapath. Builds a raw KV command (inline key in the
+ * CDW2/3/14/15 slots + CDW11.kl, transfer length in CDW10.vsize) and submits it
+ * with the region-bounded SGL iterator above, so a value up to ~64 MiB rides a
+ * single op as one data-block descriptor per 2 MiB region. A value that would
+ * exceed the region budget is REJECTED here (-EFBIG), never striped.
+ *
+ * On SUCCESS \c *cdw0_out (when non-NULL) receives the completion cdw0, which
+ * for Retrieve is the device's TRUE stored value length.
+ */
+static int
+kv_xfer_sgl(struct spdk_kv_shim *sh, uint8_t opc, const void *key, uint8_t key_len,
+	    void *value, uint32_t value_len, uint32_t *cdw0_out)
+{
+	struct spdk_nvme_cmd cmd;
 	int rc;
 
-	if (sh == NULL) {
+	if (sh == NULL || key == NULL || value == NULL || value_len == 0) {
 		return -EINVAL;
 	}
+	if (key_len < SPDK_NVME_KV_KEY_MIN_LEN || key_len > SPDK_NVME_KV_KEY_MAX_LEN) {
+		return -EINVAL;
+	}
+	/*
+	 * NO striping: reject a value that needs more than the region budget
+	 * (NVMF_REQ_MAX_BUFFERS = 33) rather than splitting it across ops. The
+	 * budget is also enforced pre-alloc by the backend via
+	 * spdk_kv_shim_max_value_len_op(); this is the authoritative guard.
+	 */
+	if (kv_region_count(value, value_len) > SPDK_KV_SHIM_MAX_SGL_REGIONS) {
+		return -EFBIG;
+	}
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.opc = opc;
+	cmd.nsid = spdk_nvme_ns_get_id(sh->ns);
+	/* CDW10: value size (Store) or host buffer size (Retrieve). */
+	cmd.cdw10_bits.kv.vsize = value_len;
+	/* CDW11: inline key length (Request Options 'ro' left 0). */
+	cmd.cdw11_bits.kv.kl = key_len;
+	/* Inline key: first 8 bytes in CDW2/3, remainder in CDW14/15. */
+	memcpy((uint8_t *)&cmd.cdw2, key, key_len < 8 ? key_len : 8);
+	if (key_len > 8) {
+		memcpy((uint8_t *)&cmd.cdw14, (const uint8_t *)key + 8, (size_t)(key_len - 8));
+	}
+
+	sh->sgl_base = value;
+	sh->sgl_total = value_len;
+	sh->sgl_off = 0;
+
 	sh->op_done = false;
-	rc = spdk_nvme_kv_retrieve(sh->ns, sh->qpair, key, key_len, value, buf_len,
-				   io_complete, sh, 0);
+	rc = spdk_nvme_ctrlr_cmd_iov_raw_with_md(sh->ctrlr, sh->qpair, &cmd, value_len,
+						 NULL, io_complete, sh,
+						 kv_reset_sgl, kv_next_sge);
 	if (rc != 0) {
 		return rc < 0 ? rc : -rc;
 	}
@@ -346,26 +460,55 @@ spdk_kv_shim_retrieve(struct spdk_kv_shim *sh, const void *key, uint8_t key_len,
 		return rc;
 	}
 	rc = status_to_rc(sh);
+	/*
+	 * The op completed; cdw0 carries the device's reported value length (the
+	 * TRUE stored length for Retrieve, even when it exceeds the host buffer).
+	 * Hand it back unconditionally so the Retrieve wrapper can drive value
+	 * auto-sizing off the 0x00-with-cdw0>buf_len and direct-0x85 cases alike.
+	 * Store passes cdw0_out == NULL and ignores it.
+	 */
+	if (cdw0_out != NULL) {
+		*cdw0_out = sh->op_cdw0;
+	}
+	return rc;
+}
+
+int
+spdk_kv_shim_store(struct spdk_kv_shim *sh, const void *key, uint8_t key_len,
+		   const void *value, uint32_t value_len)
+{
+	return kv_xfer_sgl(sh, SPDK_NVME_OPC_KV_STORE, key, key_len,
+			   (void *)(uintptr_t)value, value_len, NULL);
+}
+
+int
+spdk_kv_shim_retrieve(struct spdk_kv_shim *sh, const void *key, uint8_t key_len,
+		      void *value, uint32_t buf_len, uint32_t *value_len_out)
+{
+	uint32_t cdw0 = 0;
+	int rc = kv_xfer_sgl(sh, SPDK_NVME_OPC_KV_RETRIEVE, key, key_len,
+			     value, buf_len, &cdw0);
 
 	/*
-	 * Value auto-sizing. cdw0 carries the device's TRUE stored value length
-	 * on the value-bearing completions. A short host buffer is signalled two
-	 * ways depending on the device, and we NORMALIZE both to a single
-	 * BUFFER_TOO_SMALL (0x85) return so the caller has one contract:
-	 *   (a) the device completes SUCCESS (sc 0x00) with cdw0 > buf_len -- it
-	 *       transferred the leading buf_len bytes and reports the full length
-	 *       (this KV target's behavior, per the NVMe-KV spec); or
-	 *   (b) the device completes 0x85 INVALID_VALUE_SIZE directly with cdw0 =
-	 *       the true length.
-	 * In both cases the buffer holds at most buf_len bytes of a longer value,
-	 * so we surface 0x85 and hand back the true length; the caller resizes to
-	 * *value_len_out and re-Retrieves.
+	 * Value auto-sizing layered over the region-bounded SGL datapath. cdw0 is
+	 * the device's TRUE stored value length on the
+	 * value-bearing completions. A short host buffer is signalled two ways, and
+	 * we NORMALIZE both to a single BUFFER_TOO_SMALL (0x85) return so the caller
+	 * has one contract:
+	 *   (a) SUCCESS (sc 0x00) with cdw0 > buf_len -- the device transferred the
+	 *       leading buf_len bytes and reports the full length; or
+	 *   (b) 0x85 INVALID_VALUE_SIZE directly with cdw0 = the true length.
+	 * In both cases the buffer holds at most buf_len bytes of a longer value, so
+	 * we surface 0x85 and hand back the true length via *value_len_out; the
+	 * caller resizes to it and re-Retrieves (which builds a larger, still
+	 * region-bounded SGL). On any other return (absent key 0x87, other device
+	 * sc, or a negated errno) *value_len_out is left untouched.
 	 */
 	if (rc == 0) {
 		if (value_len_out != NULL) {
-			*value_len_out = sh->op_cdw0;
+			*value_len_out = cdw0;
 		}
-		if (sh->op_cdw0 > buf_len) {
+		if (cdw0 > buf_len) {
 			/* (a) SUCCESS but the value did not fit the buffer. */
 			return SPDK_NVME_SC_INVALID_VALUE_SIZE;
 		}
@@ -374,7 +517,7 @@ spdk_kv_shim_retrieve(struct spdk_kv_shim *sh, const void *key, uint8_t key_len,
 	if (rc == SPDK_NVME_SC_INVALID_VALUE_SIZE) {
 		/* (b) device signalled too-small directly; cdw0 is the true length. */
 		if (value_len_out != NULL) {
-			*value_len_out = sh->op_cdw0;
+			*value_len_out = cdw0;
 		}
 	}
 	return rc;

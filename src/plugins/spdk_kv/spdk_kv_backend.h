@@ -35,17 +35,19 @@ struct spdk_kv_shim;
  * in-memory kvdev, a librados-backed kvdev, a DPU-presented VF, ...); it
  * carries NO backend-specific behavior, NO KV Exec, and NO long-key path.
  *
- * SCOPE -- Exist + value auto-sizing:
- *   - Store (NIXL_WRITE) and Retrieve (NIXL_READ) of small/moderate values in
- *     host DRAM.
+ * SCOPE -- Exist + value auto-sizing + large values:
+ *   - Store (NIXL_WRITE) and Retrieve (NIXL_READ) of SMALL and LARGE values in
+ *     host DRAM. Large values (up to ~64 MiB) ride a single op via a
+ *     region-bounded SGL (one data-block descriptor per 2 MiB region, bounded by
+ *     the target's NVMF_REQ_MAX_BUFFERS = 33). NO striping: a value past the
+ *     single-op bound is rejected (NIXL_ERR_INVALID_PARAM), never split.
  *   - Exist (NIXL queryMem / QUERY -> KV Exist): cache hit/miss, NO data xfer.
  *   - Value auto-sizing on Retrieve: a short host buffer surfaces the device's
- *     TRUE value length (completion cdw0) so the caller can resize and re-READ,
- *     instead of silently truncating.
+ *     TRUE value length (completion cdw0, via getReqTrueLen) and reports
+ *     NIXL_ERR_MISMATCH so the caller can resize and re-READ, instead of
+ *     silently truncating.
  *   - 16-byte inline keys taken verbatim (opaque); no lineage parsing.
  *   - DRAM only. VRAM / P2PDMA is deferred.
- *   - Single-buffer values only. The large-value region-bounded (multi-region)
- *     SGL is deferred.
  *   - NO Delete/List (deferred), NO KV Exec (out of scope for this generic
  *     plugin by design).
  *
@@ -76,8 +78,9 @@ struct spdk_kv_shim;
  *   shim DMA buffer and copies:
  *     - WRITE: memcpy(user DRAM -> DMA buf) then Store(key, DMA buf)
  *     - READ : Retrieve(key, DMA buf) then memcpy(DMA buf -> user DRAM)
- *   A future revision (VRAM/P2PDMA, large-value SGL) registers the user/GPU
- *   buffer directly and skips the copy.
+ *   The staging DMA buffer is described to the device by a region-bounded SGL
+ *   (see spdk_kv_shim), so this holds for large values too. A future revision
+ *   (VRAM/P2PDMA) registers the user/GPU buffer directly and skips the copy.
  */
 class nixlSpdkKvEngine : public nixlBackendEngine {
 public:

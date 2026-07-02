@@ -26,12 +26,14 @@
  * Key-Value namespace, and exposes synchronous Store / Retrieve primitives
  * backed by SPDK-DMA buffers and a bounded qpair poll loop.
  *
- * Scope: Store + Retrieve + Exist of small/moderate values in host DRAM only,
- * plus value auto-sizing on Retrieve (the completion cdw0 true-length is
- * surfaced so a short buffer can be resized and retried). It carries NO
- * backend-specific behavior, NO KV Exec, and NO long-key handling. Delete/List,
- * the large-value region-bounded SGL, and VRAM/P2PDMA are deliberately left for
- * later.
+ * Scope: Store + Retrieve + Exist in host DRAM. Retrieve does value auto-sizing
+ * (the completion cdw0 true-length is surfaced so a short buffer can be resized
+ * and retried), and large values (up to ~64 MiB) are carried by a region-bounded
+ * scatter-gather list: one data-block descriptor per 2 MiB DMA region, bounded
+ * by the target's NVMF_REQ_MAX_BUFFERS (33). There is NO striping — a value past
+ * the single-op bound is rejected, never split (see the bound macros below). It
+ * carries NO backend-specific behavior, NO KV Exec, and NO long-key
+ * handling. Delete/List and VRAM/P2PDMA are deliberately left for later.
  *
  * This header is a plain C ABI (wrapped in extern "C") so the C++ NIXL backend
  * TU can link it while keeping the C-only SPDK headers isolated in the C TU.
@@ -72,6 +74,29 @@ extern "C" {
 /** Key not present (Exist miss, or Retrieve/Delete of an absent key).
  *  NVMe generic sc 0x87 (SPDK_NVME_SC_KV_KEY_DOES_NOT_EXIST). */
 #define SPDK_KV_SHIM_SC_KEY_DOES_NOT_EXIST 0x87
+
+/*
+ * Region-bounded SGL parameters for large values.
+ *
+ * A single vfio-user DMA region is one 2 MiB hugepage, and the target maps each
+ * region independently — so a single NVMe SGL data-block descriptor must not
+ * cross a 2 MiB region boundary. A large value is therefore described by one
+ * region-bounded data block per 2 MiB region (the same shape as the raw client's
+ * nvfu_sgl_set_dptr). The number of regions is bounded by the target's
+ * NVMF_REQ_MAX_BUFFERS = SPDK_NVMF_MAX_SGL_ENTRIES*2+1 = 33, capping a single
+ * KV op at ~64 MiB.
+ *
+ * NO STRIPING: a value that would need more than the region budget is out of
+ * scope for this generic plugin (the KV-cache use case sizes its blocks to fit
+ * one op) and is REJECTED, never split across ops. SPDK_KV_SHIM_MAX_VALUE_LEN is
+ * the largest value that always fits the 33-region budget even for a worst-case
+ * region-unaligned buffer (a partial first region + 32 full regions) = 64 MiB,
+ * which also matches the vfio-user target's default max_io_size.
+ */
+#define SPDK_KV_SHIM_DMA_REGION      (2ULL * 1024 * 1024)
+#define SPDK_KV_SHIM_MAX_SGL_REGIONS 33u
+#define SPDK_KV_SHIM_MAX_VALUE_LEN \
+	((uint32_t)((SPDK_KV_SHIM_MAX_SGL_REGIONS - 1u) * SPDK_KV_SHIM_DMA_REGION))
 
 /** Opaque shim handle. */
 struct spdk_kv_shim;
@@ -147,8 +172,18 @@ uint32_t spdk_kv_shim_max_value_len(const struct spdk_kv_shim *sh);
 uint32_t spdk_kv_shim_max_key_len(const struct spdk_kv_shim *sh);
 
 /**
+ * Largest value length transferable in a single op: the region-bounded SGL
+ * bound (SPDK_KV_SHIM_MAX_VALUE_LEN, ~64 MiB), further clamped to the
+ * namespace-advertised max value length (kvvml) when that is smaller and
+ * nonzero. A Store/Retrieve above this is REJECTED (-EFBIG), NOT striped.
+ */
+uint32_t spdk_kv_shim_max_value_len_op(const struct spdk_kv_shim *sh);
+
+/**
  * KV Store \c value (\c value_len bytes) under \c key. \c value must be a
- * DMA-capable buffer (from spdk_kv_shim_dma_alloc()).
+ * DMA-capable buffer (from spdk_kv_shim_dma_alloc()). Large values are carried
+ * by a region-bounded SGL (one data-block per 2 MiB region); a value larger
+ * than spdk_kv_shim_max_value_len_op() is rejected with -EFBIG (NOT striped).
  *
  * \return per the return convention documented at the top of this header.
  */
@@ -157,7 +192,9 @@ int spdk_kv_shim_store(struct spdk_kv_shim *sh, const void *key, uint8_t key_len
 
 /**
  * KV Retrieve the value for \c key into \c value (\c buf_len bytes). \c value
- * must be a DMA-capable buffer.
+ * must be a DMA-capable buffer. Large buffers are described by a region-bounded
+ * SGL (one data-block per 2 MiB region); a \c buf_len larger than
+ * spdk_kv_shim_max_value_len_op() is rejected with -EFBIG (NOT striped).
  *
  * Value auto-sizing: the completion cdw0 reports the device's TRUE stored value
  * length, which \c *value_len_out (when non-NULL) receives on both of the
@@ -168,9 +205,10 @@ int spdk_kv_shim_store(struct spdk_kv_shim *sh, const void *key, uint8_t key_len
  *     than \c buf_len; \c *value_len_out is the true length (> \c buf_len) and
  *     the buffer holds at most \c buf_len bytes of a longer value (treat the
  *     contents as unusable). The caller resizes to \c *value_len_out and
- *     re-Retrieves. Devices signal a short buffer two ways -- SUCCESS with
- *     cdw0 > buf_len, or 0x85 directly -- and BOTH are normalized to this 0x85
- *     return so the caller has one contract.
+ *     re-Retrieves (which builds a larger, still region-bounded SGL). Devices
+ *     signal a short buffer two ways -- SUCCESS with cdw0 > buf_len, or 0x85
+ *     directly -- and BOTH are normalized to this 0x85 return so the caller has
+ *     one contract.
  * On any other return (absent key 0x87, other device sc, or a negated errno)
  * \c *value_len_out is left untouched.
  *
