@@ -323,6 +323,24 @@ if [[ "$drv" != "vfio-pci" ]]; then
     exit 5
 fi
 
+# --- Raise the vfio DMA-entry limit so the no-hugepage env can map its heap. -
+# The plugin brings up SPDK with no_huge (IOVA=VA); DPDK then page-maps its heap,
+# needing far more vfio DMA mappings than the kernel default (vfio_iommu_type1
+# dma_entry_limit=65535). Without this, the controller attach fails with EAL
+# "Cannot set up DMA remapping ... (No space left on device)".
+dma_lim=/sys/module/vfio_iommu_type1/parameters/dma_entry_limit
+if [[ -e "$dma_lim" ]]; then
+    cur="$(cat "$dma_lim" 2>/dev/null || echo 0)"
+    if [[ "${cur:-0}" -lt 1048576 ]]; then
+        if echo 1048576 | sudo tee "$dma_lim" >/dev/null 2>&1; then
+            echo "== raised vfio dma_entry_limit $cur -> 1048576 ==" >&2
+        else
+            echo "WARNING: could not raise $dma_lim (currently $cur); a large transfer" >&2
+            echo "         may fail with EAL ENOSPC 'Cannot set up DMA remapping'." >&2
+        fi
+    fi
+fi
+
 # --- Run the block round-trip over PCIE. ------------------------------------
 # Selected purely by the transport-ID string; identical datapath to VFIOUSER.
 echo "== running block round-trip over PCIE against $PCI_BDF ==" >&2
@@ -340,6 +358,9 @@ The PCIE attach or round-trip failed. Common causes:
         sudo env PCI_ALLOWED="$PCI_BDF" HUGEMEM=64 "$SPDK_ROOT/scripts/setup.sh"
     (or re-run this script with BIND=1)
   * IOMMU disabled -> boot with intel_iommu=on / amd_iommu=on
+  * "Cannot set up DMA remapping ... No space left on device" -> the vfio
+    dma_entry_limit is too low (this runner raises it; if that failed, set:
+        echo 1048576 | sudo tee /sys/module/vfio_iommu_type1/parameters/dma_entry_limit )
   * wrong BDF -> confirm with: lspci -Dnn -d ::0108
 EOF
 fi
