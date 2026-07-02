@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstring>
 #include <optional>
 
@@ -153,7 +154,18 @@ nixlSpdkKvEngine::nixlSpdkKvEngine(const nixlBackendInitParams *init_params)
 
     int rc = spdk_kv_shim_open(&opts, &shim_);
     if (rc != 0 || shim_ == nullptr) {
-        NIXL_ERROR << "SPDK: spdk_kv_shim_open(" << transport_id << ") failed: rc=" << rc;
+        if (rc == -ENOTSUP) {
+            // The shim refused the bound block namespace because it carries
+            // per-LBA metadata (interleaved/extended LBA, or separate DIF/DIX).
+            // The block datapath sizes transfers from the data-only sector size,
+            // so a metadata-formatted namespace would fault at SGL build; fail
+            // cleanly here instead. Full metadata/PI support is out of scope.
+            NIXL_ERROR << "SPDK: namespace on '" << transport_id
+                       << "' carries per-LBA metadata (extended-LBA/DIF/DIX), which the "
+                          "block datapath does not support; refusing (rc=" << rc << ")";
+        } else {
+            NIXL_ERROR << "SPDK: spdk_kv_shim_open(" << transport_id << ") failed: rc=" << rc;
+        }
         shim_ = nullptr;
         initErr = true;
         return;

@@ -205,6 +205,19 @@ over-single-op-bound, and out-of-capacity guards reject cleanly.
 SPDK_ROOT=/path/to/spdk ./run_block_roundtrip.sh
 ```
 
+`run_block_metadata_reject.sh` is the negative counterpart: it stands up a
+**metadata-formatted** (interleaved / extended-LBA) `malloc` bdev as a block
+namespace and asserts the engine **refuses it cleanly at init** (a distinct
+`-ENOTSUP`), rather than faulting later at SGL build. The block datapath sizes
+transfers from the **data-only** sector size, so a namespace carrying per-LBA
+metadata (whose payload lib/nvme sizes from the larger *extended* sector size) is
+rejected at open. If the target SPDK build cannot create a metadata malloc bdev,
+the script reports `SKIP` (the guard is not exercised there).
+
+```bash
+SPDK_ROOT=/path/to/spdk ./run_block_metadata_reject.sh
+```
+
 ### Device-mode (`PCIE`) testing
 
 The block datapath is transport-agnostic, so the **same** block round-trip runs

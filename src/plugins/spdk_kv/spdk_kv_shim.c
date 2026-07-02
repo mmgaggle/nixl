@@ -249,6 +249,27 @@ spdk_kv_shim_open(const struct spdk_kv_shim_opts *opts, struct spdk_kv_shim **ou
 
 	if (sh->is_block) {
 		/*
+		 * Refuse a metadata-formatted block namespace up front. When a
+		 * namespace carries per-LBA metadata -- interleaved/extended LBA
+		 * (spdk_nvme_ns_get_extended_sector_size() > sector_size) or separate
+		 * DIF/DIX -- lib/nvme sizes the DMA payload from the EXTENDED sector
+		 * size (data + metadata), which is larger than the data-only byte
+		 * length this datapath advertises (sector_size below) and walks with
+		 * the region-bounded SGL iterator. That size mismatch would fault at
+		 * SGL build. This block datapath only supports data-only sectors
+		 * (md_size == 0); full metadata/PI (extended-LBA, DIF/DIX) support is
+		 * out of scope, so fail cleanly here with a distinct errno rather than
+		 * later at SGL build. spdk_nvme_ns_get_md_size() > 0 conservatively
+		 * covers BOTH the interleaved/extended-LBA case and separate metadata;
+		 * spdk_nvme_ns_supports_extended_lba() is a belt-and-suspenders check
+		 * for the interleaved case.
+		 */
+		if (spdk_nvme_ns_get_md_size(sh->ns) > 0 ||
+		    spdk_nvme_ns_supports_extended_lba(sh->ns)) {
+			rc = -ENOTSUP;
+			goto err_detach;
+		}
+		/*
 		 * Block namespace: cache the sector geometry the datapath needs to
 		 * turn a byte length into an LBA count and to bounds-check a range.
 		 */
