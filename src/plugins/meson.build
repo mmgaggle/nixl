@@ -140,4 +140,8 @@ if enabled_plugins.get('GPUNETIO')
     endif
 endif
 
+if enabled_plugins.get('SPDK_KV')
+    subdir('spdk_kv')
+endif
+
 subdir('telemetry')
