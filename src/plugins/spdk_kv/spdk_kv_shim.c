@@ -694,6 +694,17 @@ kv_xfer_sgl(struct spdk_kv_shim *sh, uint8_t opc, const void *key, uint8_t key_l
 		return -EINVAL;
 	}
 	/*
+	 * Byte-length guard (mirrors blk_rw's dual guard): reject a value past the
+	 * single-op ceiling BEFORE building the command, enforcing the documented
+	 * spdk_kv_shim_max_value_len_op() bound directly rather than trusting the
+	 * backend's pre-alloc clamp. A 2 MiB-aligned value can hit exactly the
+	 * 33-region budget while still exceeding the byte bound, so the region-count
+	 * check below does NOT subsume this. NO striping.
+	 */
+	if (value_len > spdk_kv_shim_max_value_len_op(sh)) {
+		return -EFBIG;
+	}
+	/*
 	 * NO striping: reject a value that needs more than the region budget
 	 * (NVMF_REQ_MAX_BUFFERS = 33) rather than splitting it across ops. The
 	 * budget is also enforced pre-alloc by the backend via
