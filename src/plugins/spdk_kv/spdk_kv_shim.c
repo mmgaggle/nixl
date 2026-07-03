@@ -57,6 +57,19 @@ struct spdk_kv_shim {
 	/* Cached block namespace capabilities (block shim). */
 	uint32_t		sector_size;	/* logical block size (bytes) */
 	uint64_t		num_sectors;	/* namespace capacity (sectors) */
+	/*
+	 * Largest single-op KV-raw value transfer in bytes, computed once at open.
+	 * Starts at the region-budget bound (SPDK_KV_SHIM_MAX_VALUE_LEN) and, on a
+	 * PCIE controller, is clamped to the device's MDTS-derived max transfer
+	 * size: the KV-raw path (spdk_nvme_ctrlr_cmd_iov_raw_with_md) bypasses
+	 * lib/nvme's MDTS splitting, so a real controller with a small MDTS must be
+	 * honored here rather than rejecting each oversized op. Left at the full
+	 * region budget on VFIOUSER, where the transport's 128 KiB max-xfer constant
+	 * is advisory and does not describe the raw region-bounded SGL path. Feeds
+	 * spdk_kv_shim_max_value_len_op(); the block path uses readv/writev (which
+	 * lib/nvme splits at MDTS) and is deliberately not clamped.
+	 */
+	uint32_t		max_xfer_op;
 	/* Whether this shim owns the SPDK env (called spdk_env_init). */
 	bool			owns_env;
 	/*
@@ -333,6 +346,29 @@ spdk_kv_shim_open(const struct spdk_kv_shim_opts *opts, struct spdk_kv_shim **ou
 		goto err_detach;
 	}
 
+	/*
+	 * Fix the single-op KV-raw transfer ceiling once, here at open. The
+	 * region-budget bound (SPDK_KV_SHIM_MAX_VALUE_LEN) is the structural ceiling
+	 * (one data-block descriptor per 2 MiB region, NVMF_REQ_MAX_BUFFERS = 33).
+	 * The KV-raw datapath (spdk_nvme_ctrlr_cmd_iov_raw_with_md) BYPASSES
+	 * lib/nvme's MDTS splitting, so on a PCIE controller -- where max_xfer_size
+	 * is derived from the device's advertised MDTS -- also clamp to that, so a
+	 * foreign controller with a small MDTS has the advertised bound lowered once
+	 * here instead of rejecting every oversized op. On VFIOUSER the transport
+	 * hardcodes a 128 KiB max_xfer_size that is advisory (the target does not
+	 * enforce it on the direct-map raw SGL path), so the full region-budget
+	 * bound is kept there. The block path is unaffected: readv/writev let
+	 * lib/nvme split at MDTS (see spdk_kv_shim_max_block_len_op).
+	 */
+	sh->max_xfer_op = SPDK_KV_SHIM_MAX_VALUE_LEN;
+	if (trid.trtype == SPDK_NVME_TRANSPORT_PCIE) {
+		uint32_t mdts_xfer = spdk_nvme_ctrlr_get_max_xfer_size(sh->ctrlr);
+
+		if (mdts_xfer != 0 && mdts_xfer < sh->max_xfer_op) {
+			sh->max_xfer_op = mdts_xfer;
+		}
+	}
+
 	*out = sh;
 	return 0;
 
@@ -563,10 +599,15 @@ spdk_kv_shim_max_block_len_op(const struct spdk_kv_shim *sh)
 	/*
 	 * A block op rides the SAME region-bounded SGL as a KV value, so its
 	 * single-op ceiling is the 33-region budget (SPDK_KV_SHIM_MAX_VALUE_LEN,
-	 * ~64 MiB). Mirrors spdk_kv_shim_max_value_len_op for the block path; there
-	 * is no block-namespace-advertised limit smaller than the budget to clamp
-	 * to here (the ~64 MiB budget matches the vfio-user target max_io_size).
-	 * Returns 0 for a non-block shim so BLK_SEG is unavailable there.
+	 * ~64 MiB) -- the target's iovec budget (NVMF_REQ_MAX_BUFFERS), NOT the
+	 * vfio-user default max_io_size (128 KiB, an unrelated per-transport
+	 * default). Unlike the KV-raw path this is deliberately NOT clamped to the
+	 * controller's MDTS: the block datapath submits via
+	 * spdk_nvme_ns_cmd_readv/writev, which lets lib/nvme split the transfer at
+	 * MDTS, so the full region budget is safe to advertise on any transport.
+	 * There is no block-namespace-advertised limit smaller than the budget to
+	 * clamp to here. Returns 0 for a non-block shim so BLK_SEG is unavailable
+	 * there.
 	 */
 	if (sh == NULL || !sh->is_block) {
 		return 0;
@@ -591,11 +632,18 @@ spdk_kv_shim_max_value_len_op(const struct spdk_kv_shim *sh)
 {
 	uint32_t cap = SPDK_KV_SHIM_MAX_VALUE_LEN;
 
-	/* The region-bounded SGL bound (~64 MiB), further clamped to the
-	 * namespace-advertised max value length when that is smaller. kvvml==0
-	 * means "no advertised limit", so it does not lower the bound. */
-	if (sh != NULL && sh->kvvml != 0 && sh->kvvml < cap) {
-		cap = sh->kvvml;
+	/*
+	 * The single-op KV-raw ceiling fixed at open (sh->max_xfer_op): the
+	 * region-bounded SGL bound (~64 MiB), clamped to the controller's
+	 * MDTS-derived max transfer size on PCIE. Further clamp to the
+	 * namespace-advertised max value length when that is smaller. kvvml==0 means
+	 * "no advertised limit", so it does not lower the bound.
+	 */
+	if (sh != NULL) {
+		cap = sh->max_xfer_op;
+		if (sh->kvvml != 0 && sh->kvvml < cap) {
+			cap = sh->kvvml;
+		}
 	}
 	return cap;
 }

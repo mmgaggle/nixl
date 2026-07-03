@@ -89,8 +89,12 @@ extern "C" {
  * scope for this generic plugin (the KV-cache use case sizes its blocks to fit
  * one op) and is REJECTED, never split across ops. SPDK_KV_SHIM_MAX_VALUE_LEN is
  * the largest value that always fits the 33-region budget even for a worst-case
- * region-unaligned buffer (a partial first region + 32 full regions) = 64 MiB,
- * which also matches the vfio-user target's default max_io_size.
+ * region-unaligned buffer (a partial first region + 32 full regions) = 64 MiB.
+ * This structural ceiling is the target's iovec budget (NVMF_REQ_MAX_BUFFERS),
+ * NOT the vfio-user default max_io_size (128 KiB, an unrelated per-transport
+ * default). On a PCIE controller the single-op bound is additionally clamped to
+ * the device's MDTS-derived max transfer size at open, because the KV-raw path
+ * bypasses lib/nvme's MDTS splitting (see spdk_kv_shim_max_value_len_op()).
  */
 #define SPDK_KV_SHIM_DMA_REGION      (2ULL * 1024 * 1024)
 #define SPDK_KV_SHIM_MAX_SGL_REGIONS 33u
@@ -272,7 +276,9 @@ uint32_t spdk_kv_shim_max_key_len(const struct spdk_kv_shim *sh);
 
 /**
  * Largest value length transferable in a single op: the region-bounded SGL
- * bound (SPDK_KV_SHIM_MAX_VALUE_LEN, ~64 MiB), further clamped to the
+ * bound (SPDK_KV_SHIM_MAX_VALUE_LEN, ~64 MiB), clamped on a PCIE controller to
+ * its MDTS-derived max transfer size (the KV-raw path bypasses lib/nvme's MDTS
+ * splitting, so a small-MDTS device is honored here), and further clamped to the
  * namespace-advertised max value length (kvvml) when that is smaller and
  * nonzero. A Store/Retrieve above this is REJECTED (-EFBIG), NOT striped.
  */
