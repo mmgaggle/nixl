@@ -24,6 +24,7 @@
 
 #include "backend/backend_engine.h"
 #include "spdk_kv_key.h" // spdkKvKeyFromBlobId (SPDK-free key mapping)
+#include "sync.h" // nixlLock / NIXL_LOCK_GUARD (built from init_params->syncMode)
 
 // Forward declaration of the opaque SPDK KV shim handle (C ABI).
 struct spdk_kv_shim;
@@ -259,6 +260,19 @@ private:
     // cross-mode remote (OBJ_SEG in block mode, BLK_SEG in KV mode) so a KV op is
     // never routed to a block namespace (the KV opcodes alias NVM WRITE/READ).
     bool blockMode_ = false;
+
+    // Serializes every shim-touching entry point against concurrent agent
+    // threads. NIXL's NIXL_THREAD_SYNC_RW mode takes only a SHARED (reader) lock
+    // around postXfer, so two agent threads can be inside one engine at once;
+    // the shim owns a single qpair and shared SGL-iterator/completion state, so
+    // the backend must self-serialize. Held EXCLUSIVELY (NIXL_LOCK_GUARD) across
+    // the whole synchronous op (submit+poll) by postXfer (which also covers its
+    // postXferBlock delegation), queryMem, registerMem and deregisterMem -- the
+    // methods that touch the shim's DMA tracker / qpair. Built from
+    // init_params->syncMode: a real mutex under STRICT/RW, a no-op under
+    // NIXL_THREAD_SYNC_NONE (behavior unchanged there). Mutable so the const
+    // transfer entry points can take it.
+    mutable nixlLock shim_lock_;
 };
 
 #endif // SPDK_KV_BACKEND_H

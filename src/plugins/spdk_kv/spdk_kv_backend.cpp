@@ -99,7 +99,8 @@ parseBool(const std::string &v) {
 // -----------------------------------------------------------------------------
 
 nixlSpdkKvEngine::nixlSpdkKvEngine(const nixlBackendInitParams *init_params)
-    : nixlBackendEngine(init_params) {
+    : nixlBackendEngine(init_params),
+      shim_lock_(init_params->syncMode) {
     // Preferred config is a full SPDK transport ID string,
     // e.g. "trtype:VFIOUSER traddr:<socket-dir>". For ergonomics also accept a
     // bare socket directory and wrap it into a VFIOUSER transport ID.
@@ -251,6 +252,10 @@ nixl_status_t
 nixlSpdkKvEngine::registerMem(const nixlBlobDesc &mem,
                               const nixl_mem_t &nixl_mem,
                               nixlBackendMD *&out) {
+    // Serialize the shim's DMA-registration (spdk_kv_shim_mem_register on the
+    // DRAM_SEG path, which mutates the shared SPDK memory map and probes the
+    // qpair's DMA reachability) against a concurrent postXfer/queryMem.
+    NIXL_LOCK_GUARD(shim_lock_);
     if (nixl_mem != DRAM_SEG && nixl_mem != OBJ_SEG && nixl_mem != BLK_SEG)
         return NIXL_ERR_NOT_SUPPORTED;
 
@@ -325,6 +330,10 @@ nixlSpdkKvEngine::registerMem(const nixlBlobDesc &mem,
 
 nixl_status_t
 nixlSpdkKvEngine::deregisterMem(nixlBackendMD *meta) {
+    // Serialize the shim's DMA-deregistration (spdk_kv_shim_mem_unregister
+    // mutates the shared SPDK memory map the datapath translates against)
+    // against a concurrent postXfer/queryMem/registerMem.
+    NIXL_LOCK_GUARD(shim_lock_);
     // A DRAM registration that took the zero-copy path holds an SPDK memory
     // registration; release it before freeing the MD. NIXL deregisters only
     // after all transfers to the region have completed, so no DMA is in flight.
@@ -396,6 +405,12 @@ nixlSpdkKvEngine::postXfer(const nixl_xfer_op_t &operation,
         NIXL_ERROR << "SPDK_KV: transfer request handle is null";
         return NIXL_ERR_INVALID_PARAM;
     }
+    // Serialize the shim's single qpair + shared SGL/completion state for the
+    // whole synchronous op (submit+poll). Held here rather than inside
+    // postXferBlock so the block delegation below runs UNDER this same lock
+    // without re-locking (absl::Mutex is non-recursive -> a second guard would
+    // self-deadlock).
+    NIXL_LOCK_GUARD(shim_lock_);
     if (!shim_) {
         NIXL_ERROR << "SPDK_KV: shim not initialized";
         return NIXL_ERR_BACKEND;
@@ -746,6 +761,9 @@ nixlSpdkKvEngine::releaseReqH(nixlBackendReqH *handle) const {
 nixl_status_t
 nixlSpdkKvEngine::queryMem(const nixl_reg_dlist_t &descs,
                           std::vector<nixl_query_resp_t> &resp) const {
+    // Serialize the shim's single qpair (spdk_kv_shim_exist submits+polls) and
+    // shared completion state against a concurrent postXfer/registerMem.
+    NIXL_LOCK_GUARD(shim_lock_);
     // Mirror the OBJ backend's queryMem result/absence convention exactly:
     //   - resp is sized to descCount() and defaulted to std::nullopt (absent).
     //   - present => resp[i] = nixl_query_resp_t{nixl_b_params_t{}} (engaged).
