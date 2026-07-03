@@ -21,16 +21,6 @@
 # host shim, so the -Dspdk_kv_shim_dir option is unused here.
 # ---------------------------------------------------------------------------
 
-# The top-level project() declares only C++ (and optionally CUDA); it does NOT
-# enable the C language. This plugin compiles its own C shim (spdk_kv_shim.c),
-# so enable the host C compiler here. This keeps the SPDK plugin self-contained: it does
-# not rely on another plugin having flipped the project languages to include C.
-# add_languages is idempotent, so this is a no-op if C was already enabled by a
-# co-built plugin or the top-level project.
-add_languages('c', native: false, required: true)
-
-cc = meson.get_compiler('c')
-
 # Location of the (already-built) SPDK tree we link against.
 spdk_root = get_option('spdk_root')
 
@@ -42,6 +32,9 @@ vfu_lib = spdk_root / 'build' / 'libvfio-user' / 'usr' / 'local' / 'lib'
 
 # The plugin is gated on the prebuilt SPDK NVMe library (which carries the KV
 # command set) and the KV public header. Skip cleanly when they are absent.
+# These checks need no C compiler, so run them before acquiring one: a default
+# `meson setup` reaches this file (SPDK is in all_plugins), and on a host with
+# no SPDK build the plugin must skip rather than fail configuration.
 if not fs.exists(spdk_build_lib / 'libspdk_nvme.a')
     warning('SPDK plugin disabled: SPDK nvme lib not found under ' + spdk_build_lib)
     subdir_done()
@@ -50,6 +43,21 @@ if not fs.exists(spdk_inc / 'spdk' / 'nvme_kv.h')
     warning('SPDK plugin disabled: spdk/nvme_kv.h not found under ' + spdk_inc)
     subdir_done()
 endif
+
+# The top-level project() declares only C++ (and optionally CUDA); it does NOT
+# enable the C language. This plugin compiles its own C shim (spdk_kv_shim.c),
+# so enable the host C compiler here. This keeps the SPDK plugin self-contained: it
+# does not rely on another plugin having flipped the project languages to include C.
+# add_languages is idempotent, so this is a no-op if C was already enabled by a
+# co-built plugin or the top-level project. Request it non-fatally and degrade to
+# the same clean skip when no C compiler is present, rather than hard-failing the
+# whole tree.
+if not add_languages('c', native: false, required: false)
+    warning('SPDK plugin disabled: no C compiler available for the C shim')
+    subdir_done()
+endif
+
+cc = meson.get_compiler('c')
 
 # Include dirs: the plugin's own headers, plus the SPDK C headers (needed by
 # the C shim and by the C++ TUs that include spdk_kv_shim.h).
