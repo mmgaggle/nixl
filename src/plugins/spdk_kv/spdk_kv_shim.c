@@ -34,6 +34,7 @@
 #include "spdk/util.h"	/* spdk_divide_round_up(), SPDK_ALIGN_FLOOR() */
 
 #include "spdk_kv_shim.h"
+#include "spdk_kv_fence.h"
 
 /*
  * Per-op completion budget. Bounds how long an in-flight KV command may run
@@ -59,24 +60,27 @@ struct spdk_kv_shim {
 	/* Whether this shim owns the SPDK env (called spdk_env_init). */
 	bool			owns_env;
 	/*
-	 * Single in-flight op completion state. Ops are strictly synchronous
-	 * (submit, then poll to completion before returning), and the shim uses
-	 * one qpair from one thread, so at most one op is outstanding at a time.
-	 * The completion callback records into these fields and the submitting
-	 * op reads them back after the poll.
+	 * Single in-flight op completion + fence state. Ops are strictly
+	 * synchronous (submit, then poll to completion before returning), and the
+	 * shim uses one qpair from one thread, so at most one op is outstanding at
+	 * a time. The completion callback records into the fence's slot and the
+	 * submitting op reads it back after the poll.
 	 *
-	 * NOTE (deferred robustness): if an op ever times out or the qpair
-	 * transport-fails, vfio-user does not abort the outstanding hardware
-	 * tracker on disconnect/reconnect, so a late "orphan" completion could
-	 * fire during a later op's poll and be mis-recorded. The production
-	 * datapath needs per-op identity-token + reconnect handling; that
-	 * hardening is out of scope for this walking skeleton, which targets a
-	 * healthy in-memory/vfio-user target.
+	 * Timeout / transport-failure hardening (see spdk_kv_fence.h): if an op
+	 * times out or the qpair transport-fails, the outstanding hardware tracker
+	 * is NOT aborted (vfio-user does not abort trackers on disconnect), so a
+	 * late "orphan" completion could otherwise fire later and be mis-recorded,
+	 * and the target could DMA into a freed staging buffer. The fence closes
+	 * both windows: begin() stamps each op with a generation the completion
+	 * checks (stale orphans are discarded), a timeout/-ENXIO latches the fence
+	 * POISONED so no later op is submitted under the live tracker, and the
+	 * staging buffer of a poisoned op is quarantined rather than freed until
+	 * the fencing teardown in spdk_kv_shim_close() proves the tracker dead.
+	 * op_tag is this shim's single per-op completion cb_arg (safe to embed and
+	 * reuse precisely because a poisoned fence refuses any reuse-while-live).
 	 */
-	volatile bool		op_done;
-	volatile uint8_t	op_sct;
-	volatile uint8_t	op_sc;
-	volatile uint32_t	op_cdw0;
+	struct spdk_kv_fence	fence;
+	struct spdk_kv_op_tag	op_tag;
 	/*
 	 * Region-bounded SGL iterator state for the in-flight op. lib/nvme drives
 	 * kv_reset_sgl()/kv_next_sge() (below) with this shim as the callback arg to
@@ -107,18 +111,23 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 static void
 io_complete(void *arg, const struct spdk_nvme_cpl *cpl)
 {
-	struct spdk_kv_shim *sh = arg;
-
-	sh->op_sct = cpl->status.sct;
-	sh->op_sc = cpl->status.sc;
-	sh->op_cdw0 = cpl->cdw0;
-	sh->op_done = true;
+	/*
+	 * cb_arg is the per-op tag stamped at submit, NOT the shim: the fence
+	 * discards a completion whose generation no longer matches the op the
+	 * poller is waiting for, so a late orphan from a timed-out op cannot be
+	 * mis-recorded as the current op's status.
+	 */
+	spdk_kv_fence_complete(arg, cpl->status.sct, cpl->status.sc, cpl->cdw0);
 }
 
 /*
  * Poll the qpair until the in-flight command completes, the qpair fails at the
  * transport layer (-ENXIO), or the per-op timeout expires (-ETIMEDOUT).
  * Returns 0 on completion (caller reads status_to_rc()).
+ *
+ * A non-zero return means the op did NOT complete and its hardware tracker may
+ * still be live; latch the fence POISONED so no later op is submitted (and no
+ * staging buffer is freed) under that live tracker until a fencing teardown.
  */
 static int
 poll_to_completion(struct spdk_kv_shim *sh)
@@ -126,13 +135,15 @@ poll_to_completion(struct spdk_kv_shim *sh)
 	uint64_t deadline = spdk_get_ticks() +
 			    (uint64_t)SPDK_KV_SHIM_OP_TIMEOUT_S * spdk_get_ticks_hz();
 
-	while (!sh->op_done) {
+	while (!spdk_kv_fence_done(&sh->fence)) {
 		int32_t n = spdk_nvme_qpair_process_completions(sh->qpair, 0);
 
 		if (n < 0) {
+			spdk_kv_fence_poison(&sh->fence);
 			return n;
 		}
-		if (!sh->op_done && spdk_get_ticks() >= deadline) {
+		if (!spdk_kv_fence_done(&sh->fence) && spdk_get_ticks() >= deadline) {
+			spdk_kv_fence_poison(&sh->fence);
 			return -ETIMEDOUT;
 		}
 	}
@@ -148,10 +159,10 @@ poll_to_completion(struct spdk_kv_shim *sh)
 static int
 status_to_rc(struct spdk_kv_shim *sh)
 {
-	if (sh->op_sct != SPDK_NVME_SCT_GENERIC) {
+	if (sh->fence.op_sct != SPDK_NVME_SCT_GENERIC) {
 		return -EIO;
 	}
-	return (int)sh->op_sc;
+	return (int)sh->fence.op_sc;
 }
 
 int
@@ -181,6 +192,7 @@ spdk_kv_shim_open(const struct spdk_kv_shim_opts *opts, struct spdk_kv_shim **ou
 	if (sh == NULL) {
 		return -ENOMEM;
 	}
+	spdk_kv_fence_init(&sh->fence);
 
 	if (opts->init_env) {
 		struct spdk_env_opts env_opts;
@@ -343,8 +355,19 @@ spdk_kv_shim_close(struct spdk_kv_shim *sh)
 		return;
 	}
 	if (sh->qpair != NULL) {
+		/*
+		 * Tear the qpair down FIRST: freeing it reclaims the hardware
+		 * trackers, so no orphan completion can fire afterward. This is the
+		 * fencing operation that makes it safe to release the quarantine.
+		 */
 		spdk_nvme_ctrlr_free_io_qpair(sh->qpair);
 	}
+	/*
+	 * The qpair (and its trackers) are gone: any staging buffers quarantined
+	 * on a timed-out / transport-failed op can no longer be DMA'd into, so free
+	 * them now (each exactly once) and clear the poison latch.
+	 */
+	spdk_kv_fence_drain(&sh->fence, spdk_dma_free);
 	if (sh->ctrlr != NULL) {
 		spdk_nvme_detach(sh->ctrlr);
 	}
@@ -369,6 +392,29 @@ spdk_kv_shim_dma_alloc_aligned(size_t len, size_t align)
 void
 spdk_kv_shim_dma_free(void *buf)
 {
+	spdk_dma_free(buf);
+}
+
+void
+spdk_kv_shim_release_io_buf(struct spdk_kv_shim *sh, void *buf)
+{
+	if (buf == NULL) {
+		return;
+	}
+	/*
+	 * If the shim is poisoned, the most recent op timed out / transport-failed
+	 * with its DMA tracker possibly still live: freeing this staging buffer now
+	 * would return still-DMA-mapped memory to the heap, which a recovered target
+	 * could DMA into (a use-after-free that silently corrupts client memory).
+	 * Quarantine it instead; it is freed at the fencing teardown in
+	 * spdk_kv_shim_close(). If the quarantine node cannot be allocated the
+	 * buffer is intentionally leaked -- a bounded leak under post-failure memory
+	 * pressure is strictly safer than a use-after-free.
+	 */
+	if (sh != NULL && spdk_kv_fence_poisoned(&sh->fence)) {
+		(void)spdk_kv_fence_quarantine(&sh->fence, buf);
+		return;
+	}
 	spdk_dma_free(buf);
 }
 
@@ -581,7 +627,11 @@ kv_region_count(const void *base, uint32_t len)
 static void
 kv_reset_sgl(void *cb_arg, uint32_t offset)
 {
-	struct spdk_kv_shim *sh = cb_arg;
+	/*
+	 * cb_arg is the op's fence tag (&sh->op_tag), shared with io_complete; the
+	 * SGL iterator lives in the enclosing shim, so recover it from the tag.
+	 */
+	struct spdk_kv_shim *sh = SPDK_CONTAINEROF(cb_arg, struct spdk_kv_shim, op_tag);
 
 	sh->sgl_off = offset;
 }
@@ -595,7 +645,8 @@ kv_reset_sgl(void *cb_arg, uint32_t offset)
 static int
 kv_next_sge(void *cb_arg, void **address, uint32_t *length)
 {
-	struct spdk_kv_shim *sh = cb_arg;
+	/* cb_arg is &sh->op_tag (shared with io_complete); recover the shim. */
+	struct spdk_kv_shim *sh = SPDK_CONTAINEROF(cb_arg, struct spdk_kv_shim, op_tag);
 	uint64_t addr = (uint64_t)(uintptr_t)sh->sgl_base + sh->sgl_off;
 	uint32_t remaining = sh->sgl_total - sh->sgl_off;
 	uint32_t to_boundary =
@@ -669,9 +720,12 @@ kv_xfer_sgl(struct spdk_kv_shim *sh, uint8_t opc, const void *key, uint8_t key_l
 	sh->sgl_total = value_len;
 	sh->sgl_off = 0;
 
-	sh->op_done = false;
+	/* Refuse to submit onto a poisoned (timed-out / fenced) qpair. */
+	if (!spdk_kv_fence_begin(&sh->fence, &sh->op_tag)) {
+		return -ESHUTDOWN;
+	}
 	rc = spdk_nvme_ctrlr_cmd_iov_raw_with_md(sh->ctrlr, sh->qpair, &cmd, value_len,
-						 NULL, io_complete, sh,
+						 NULL, io_complete, &sh->op_tag,
 						 kv_reset_sgl, kv_next_sge);
 	if (rc != 0) {
 		return rc < 0 ? rc : -rc;
@@ -689,7 +743,7 @@ kv_xfer_sgl(struct spdk_kv_shim *sh, uint8_t opc, const void *key, uint8_t key_l
 	 * Store passes cdw0_out == NULL and ignores it.
 	 */
 	if (cdw0_out != NULL) {
-		*cdw0_out = sh->op_cdw0;
+		*cdw0_out = sh->fence.op_cdw0;
 	}
 	return rc;
 }
@@ -759,8 +813,11 @@ spdk_kv_shim_exist(struct spdk_kv_shim *sh, const void *key, uint8_t key_len)
 	if (sh->is_block) {
 		return -EINVAL;
 	}
-	sh->op_done = false;
-	rc = spdk_nvme_kv_exist(sh->ns, sh->qpair, key, key_len, io_complete, sh);
+	/* Refuse to submit onto a poisoned (timed-out / fenced) qpair. */
+	if (!spdk_kv_fence_begin(&sh->fence, &sh->op_tag)) {
+		return -ESHUTDOWN;
+	}
+	rc = spdk_nvme_kv_exist(sh->ns, sh->qpair, key, key_len, io_complete, &sh->op_tag);
 	if (rc != 0) {
 		return rc < 0 ? rc : -rc;
 	}
@@ -833,14 +890,17 @@ blk_rw(struct spdk_kv_shim *sh, bool is_write, void *buf, uint64_t lba,
 	sh->sgl_total = byte_len;
 	sh->sgl_off = 0;
 
-	sh->op_done = false;
+	/* Refuse to submit onto a poisoned (timed-out / fenced) qpair. */
+	if (!spdk_kv_fence_begin(&sh->fence, &sh->op_tag)) {
+		return -ESHUTDOWN;
+	}
 	if (is_write) {
 		rc = spdk_nvme_ns_cmd_writev(sh->ns, sh->qpair, lba, lba_count,
-					     io_complete, sh, 0,
+					     io_complete, &sh->op_tag, 0,
 					     kv_reset_sgl, kv_next_sge);
 	} else {
 		rc = spdk_nvme_ns_cmd_readv(sh->ns, sh->qpair, lba, lba_count,
-					    io_complete, sh, 0,
+					    io_complete, &sh->op_tag, 0,
 					    kv_reset_sgl, kv_next_sge);
 	}
 	if (rc != 0) {

@@ -197,8 +197,25 @@ void *spdk_kv_shim_dma_alloc(size_t len);
  */
 void *spdk_kv_shim_dma_alloc_aligned(size_t len, size_t align);
 
-/** Free a buffer returned by spdk_kv_shim_dma_alloc[_aligned](). Safe with NULL. */
+/** Free a buffer returned by spdk_kv_shim_dma_alloc[_aligned](). Safe with NULL.
+ *  Use this ONLY for buffers not tied to an in-flight op (e.g. cleaning up after
+ *  an alloc failure). To release a per-op STAGING buffer after an op returned,
+ *  use spdk_kv_shim_release_io_buf() so a timed-out op's still-live DMA tracker
+ *  cannot be left pointing at freed memory. */
 void spdk_kv_shim_dma_free(void *buf);
+
+/**
+ * Release a per-op STAGING buffer (from spdk_kv_shim_dma_alloc[_aligned]()) once
+ * the op that used it has returned. Normally this frees \c buf immediately, but
+ * if the op timed out or the qpair transport-failed -- leaving its DMA tracker
+ * possibly still live -- the shim is POISONED and \c buf is QUARANTINED instead
+ * of freed, then released at the fencing teardown in spdk_kv_shim_close(). This
+ * prevents a recovered target from DMA-ing into a freed buffer (a use-after-free
+ * that would silently corrupt caller memory). Safe with \c buf == NULL. After a
+ * poisoning error the shim refuses further ops (returns -ESHUTDOWN) until it is
+ * closed.
+ */
+void spdk_kv_shim_release_io_buf(struct spdk_kv_shim *sh, void *buf);
 
 /**
  * Make a caller-owned host region [\c vaddr, \c vaddr + \c len) usable DIRECTLY

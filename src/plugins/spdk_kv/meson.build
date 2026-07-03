@@ -68,7 +68,7 @@ spdk_kv_spdk_inc = include_directories(spdk_inc, spdk_build_inc, is_system: true
 # flags and the C-only SPDK headers stay isolated from the C++ plugin TUs.
 spdk_kv_shim_lib = static_library(
     'nixl_spdk_kv_shim',
-    ['spdk_kv_shim.c'],
+    ['spdk_kv_shim.c', 'spdk_kv_fence.c'],
     c_args: ['-D_GNU_SOURCE', '-w'],
     include_directories: [spdk_kv_local_inc, spdk_kv_spdk_inc],
     install: false,
@@ -180,6 +180,17 @@ endif
 # target). Enabled by -Dspdk_kv_build_test=true. The KV test drives the OBJ_SEG
 # Store/Retrieve path; the block test drives the BLK_SEG LBA read/write path.
 if get_option('spdk_kv_build_test')
+    # Pure-logic unit test for the timeout/orphan/quarantine fence. It links only
+    # the SPDK-free spdk_kv_fence.c (no lib/nvme, no live target, no hugepages),
+    # so it exercises the stale-orphan discard, poison latch, and staging-buffer
+    # quarantine accounting standalone.
+    executable(
+        'spdk_kv_fence_test',
+        ['spdk_kv_fence_test.c', 'spdk_kv_fence.c'],
+        c_args: ['-D_GNU_SOURCE'],
+        include_directories: [spdk_kv_local_inc],
+        install: false,
+    )
     executable(
         'spdk_kv_roundtrip_test',
         ['spdk_kv_roundtrip_test.cpp', 'spdk_kv_backend.cpp', 'spdk_kv_backend.h',

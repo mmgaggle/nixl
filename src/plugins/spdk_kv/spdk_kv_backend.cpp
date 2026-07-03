@@ -522,7 +522,11 @@ nixlSpdkKvEngine::postXfer(const nixl_xfer_op_t &operation,
                 // tail untouched (we never over-read/over-copy).
                 if (r == 0 && !use_direct) std::memcpy(data_ptr, io_buf, value_len_out);
             }
-            if (!use_direct) spdk_kv_shim_dma_free(io_buf);
+            // Quarantine-aware release: if the op timed out / transport-failed
+            // the shim is poisoned and this quarantines io_buf (freed later at
+            // the fencing teardown) instead of freeing it under a possibly-live
+            // DMA tracker. Covers the demoted staged retry too (run again here).
+            if (!use_direct) spdk_kv_shim_release_io_buf(shim_, io_buf);
             return r;
         };
 
@@ -693,7 +697,11 @@ nixlSpdkKvEngine::postXferBlock(const nixl_xfer_op_t &operation,
                 r = spdk_kv_shim_read(shim_, io_buf, lba, nlba);
                 if (r == 0 && !use_direct) std::memcpy(data_ptr, io_buf, data_len);
             }
-            if (!use_direct) spdk_kv_shim_dma_free(io_buf);
+            // Quarantine-aware release: if the op timed out / transport-failed
+            // the shim is poisoned and this quarantines io_buf (freed later at
+            // the fencing teardown) instead of freeing it under a possibly-live
+            // DMA tracker. Covers the demoted staged retry too (run again here).
+            if (!use_direct) spdk_kv_shim_release_io_buf(shim_, io_buf);
             return r;
         };
 
@@ -703,6 +711,7 @@ nixlSpdkKvEngine::postXferBlock(const nixl_xfer_op_t &operation,
                       << " (rc=" << rc << "); demoting to a staged copy";
             rc = run_blk(false);
         }
+
         if (rc != 0) {
             NIXL_ERROR << "SPDK: block descriptor " << i << " transfer failed: rc=" << rc;
             req_h->status = NIXL_ERR_BACKEND;
