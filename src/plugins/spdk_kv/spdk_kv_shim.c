@@ -425,10 +425,46 @@ spdk_kv_shim_dma_alloc_aligned(size_t len, size_t align)
 	return spdk_dma_zmalloc(len, align, NULL);
 }
 
+/*
+ * Non-zeroing (raw) variants for a STAGING buffer the caller fully initializes
+ * before use: spdk_dma_malloc skips the up-to-64 MiB zero-fill that the zeroing
+ * variants above pay per staged op. This is safe for staging precisely because a
+ * staged WRITE memcpys the entire span before the Store/write, and a staged READ
+ * only ever copies back the bytes the device actually wrote (the cdw0 true length
+ * for a KV Retrieve; the full transfer length for a block read) -- trailing
+ * never-written bytes are never handed to the caller, so pre-zeroing them is pure
+ * overhead. Same free/release rules as the zeroing variants.
+ */
+void *
+spdk_kv_shim_dma_alloc_raw(size_t len)
+{
+	return spdk_dma_malloc(len, 0, NULL);
+}
+
+void *
+spdk_kv_shim_dma_alloc_raw_aligned(size_t len, size_t align)
+{
+	return spdk_dma_malloc(len, align, NULL);
+}
+
 void
 spdk_kv_shim_dma_free(void *buf)
 {
 	spdk_dma_free(buf);
+}
+
+bool
+spdk_kv_shim_poisoned(const struct spdk_kv_shim *sh)
+{
+	/*
+	 * Expose the fence's poison latch so a caller that CACHES a staging buffer
+	 * for reuse can tell, after an op, whether that buffer may still be a live
+	 * DMA target (the op timed out / transport-failed). If so the caller must
+	 * route it through spdk_kv_shim_release_io_buf() -- which quarantines it --
+	 * and drop it from its reuse cache; a quarantined buffer must never be
+	 * recycled. NULL-safe.
+	 */
+	return sh != NULL && spdk_kv_fence_poisoned(&sh->fence);
 }
 
 void

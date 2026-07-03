@@ -252,8 +252,38 @@ private:
                   const nixl_meta_dlist_t &remote,
                   nixlBackendReqH *handle) const;
 
+    // Reusable per-engine STAGING buffer for the fallback (staged-copy) datapath.
+    //
+    // Acquire the buffer sized to at least \c len, aligned to \c align (0 = the
+    // allocator default), growing/reallocating as needed; returns nullptr on
+    // allocation failure (leaving the cache empty). Release it after the op:
+    // stagingRelease keeps it cached for the next descriptor/post when the shim is
+    // healthy, but when the shim is POISONED (the op timed out / transport-failed
+    // with a possibly-live DMA tracker) it hands the buffer to the shim's
+    // quarantine and DROPS it from the cache -- so a quarantined buffer, whose
+    // ownership has transferred to the shim, is never handed out again. See the
+    // stagingBuf_ member note for the single-in-flight-op assumption this relies
+    // on.
+    void *stagingAcquire(size_t len, size_t align) const;
+    void stagingRelease(void *buf) const;
+
     // The SPDK KV shim handle (owns the controller attach + qpair).
     spdk_kv_shim *shim_ = nullptr;
+
+    // Lazily-grown, reused STAGING buffer + its capacity for the staged-copy
+    // fallback. The engine is single-threaded and the shim polls each op to
+    // completion before returning, so at most ONE shim op is in flight at a time
+    // -- one staging buffer therefore serves every descriptor and every post,
+    // replacing the per-descriptor alloc+free. Grown on demand and freed exactly
+    // once in the dtor (before spdk_kv_shim_close()). POISON INVARIANT: the cache
+    // only ever holds a buffer whose last op completed cleanly; a poisoned op's
+    // buffer is transferred to the shim's quarantine and the cache is NULLed
+    // (stagingRelease), so it can never be recycled and is freed once at the
+    // fencing teardown -- never double-freed against this cache. mutable so the
+    // const postXfer path can maintain it. (If the deferred async rework lands,
+    // staging moves into the per-op context instead.)
+    mutable void *stagingBuf_ = nullptr;
+    mutable size_t stagingCap_ = 0;
 
     // Effective key length: min(kMaxKeyLen, kvkml advertised by the namespace).
     uint8_t maxKeyLen_ = kMaxKeyLen;

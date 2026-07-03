@@ -241,9 +241,65 @@ nixlSpdkKvEngine::nixlSpdkKvEngine(const nixlBackendInitParams *init_params)
 }
 
 nixlSpdkKvEngine::~nixlSpdkKvEngine() {
+    // Free the reusable staging buffer (if any) BEFORE closing the shim. It is
+    // only ever cached after a HEALTHY op -- a poisoned op transfers its buffer to
+    // the shim's quarantine and NULLs the cache -- so its DMA tracker is dead and
+    // a direct free is safe, and it is never also in the quarantine (no
+    // double-free with spdk_kv_shim_close's drain). Free it first because for an
+    // init_env=true shim spdk_kv_shim_close() tears down the SPDK env, after which
+    // spdk_dma_free would be invalid.
+    if (stagingBuf_ != nullptr) {
+        spdk_kv_shim_dma_free(stagingBuf_);
+        stagingBuf_ = nullptr;
+        stagingCap_ = 0;
+    }
     if (shim_) {
         spdk_kv_shim_close(shim_);
         shim_ = nullptr;
+    }
+}
+
+void *
+nixlSpdkKvEngine::stagingAcquire(size_t len, size_t align) const {
+    // Reuse the cached buffer in place when it is big enough. Alignment is
+    // invariant per engine (the KV path always passes 0, the block path always
+    // SPDK_KV_SHIM_DMA_REGION), so a size check suffices.
+    if (stagingBuf_ != nullptr && stagingCap_ >= len) {
+        return stagingBuf_;
+    }
+    // Need a first or bigger buffer. The cache only ever holds a buffer whose last
+    // op completed cleanly (a poisoned op routes its buffer to quarantine and
+    // NULLs the cache in stagingRelease), so the old buffer's DMA tracker is dead
+    // and it is safe to free directly here before growing.
+    if (stagingBuf_ != nullptr) {
+        spdk_kv_shim_dma_free(stagingBuf_);
+        stagingBuf_ = nullptr;
+        stagingCap_ = 0;
+    }
+    void *b = (align != 0) ? spdk_kv_shim_dma_alloc_raw_aligned(len, align)
+                           : spdk_kv_shim_dma_alloc_raw(len);
+    if (b == nullptr) {
+        return nullptr;
+    }
+    stagingBuf_ = b;
+    stagingCap_ = len;
+    return b;
+}
+
+void
+nixlSpdkKvEngine::stagingRelease(void *buf) const {
+    // POISON SAFETY (hard invariant from the fence design): if the op timed out or
+    // the qpair transport-failed, the shim is poisoned and buf's DMA tracker may
+    // still be live. Hand buf to spdk_kv_shim_release_io_buf(), which QUARANTINES
+    // it (freed only at the fencing teardown in spdk_kv_shim_close()), and DROP it
+    // from the reuse cache so this buffer -- now owned by the quarantine -- is
+    // never handed out again. On the healthy path the op's tracker is dead, so
+    // keep buf cached for the next descriptor/post (no free, no release) rather
+    // than churning an alloc+free per op.
+    if (spdk_kv_shim_poisoned(shim_)) {
+        spdk_kv_shim_release_io_buf(shim_, buf); // -> quarantine
+        stagingBuf_ = nullptr;
+        stagingCap_ = 0;
     }
 }
 
@@ -574,7 +630,10 @@ nixlSpdkKvEngine::postXfer(const nixl_xfer_op_t &operation,
         auto run_kv = [&](bool use_direct) -> int {
             void *io_buf = data_ptr;
             if (!use_direct) {
-                io_buf = spdk_kv_shim_dma_alloc(data_len);
+                // Reuse the engine's cached, non-zeroing staging buffer. The
+                // whole span is memcpy'd (WRITE) or device-filled (READ) below, so
+                // the skipped zero-fill is never observed.
+                io_buf = stagingAcquire(data_len, 0);
                 if (!io_buf) {
                     NIXL_ERROR << "SPDK_KV: DMA buffer alloc failed (" << data_len << " bytes)";
                     return -ENOMEM;
@@ -594,14 +653,17 @@ nixlSpdkKvEngine::postXfer(const nixl_xfer_op_t &operation,
                 // The whole value fit: value_len_out is the device's TRUE value
                 // length and is <= data_len. In staged mode copy exactly those
                 // bytes back; a value shorter than the buffer leaves the caller's
-                // tail untouched (we never over-read/over-copy).
+                // tail untouched (we never over-read/over-copy). Because we copy
+                // back only these device-written bytes, the staging buffer's
+                // uninitialized (non-zeroed) tail never reaches the caller.
                 if (r == 0 && !use_direct) std::memcpy(data_ptr, io_buf, value_len_out);
             }
-            // Quarantine-aware release: if the op timed out / transport-failed
-            // the shim is poisoned and this quarantines io_buf (freed later at
-            // the fencing teardown) instead of freeing it under a possibly-live
-            // DMA tracker. Covers the demoted staged retry too (run again here).
-            if (!use_direct) spdk_kv_shim_release_io_buf(shim_, io_buf);
+            // Quarantine-aware release: on the healthy path the buffer stays
+            // cached for reuse; if the op timed out / transport-failed the shim is
+            // poisoned and this quarantines io_buf (freed later at the fencing
+            // teardown) and drops it from the cache, instead of recycling a
+            // possibly-live DMA target. Covers the demoted staged retry too.
+            if (!use_direct) stagingRelease(io_buf);
             return r;
         };
 
@@ -765,7 +827,10 @@ nixlSpdkKvEngine::postXferBlock(const nixl_xfer_op_t &operation,
         auto run_blk = [&](bool use_direct) -> int {
             void *io_buf = data_ptr;
             if (!use_direct) {
-                io_buf = spdk_kv_shim_dma_alloc_aligned(data_len, SPDK_KV_SHIM_DMA_REGION);
+                // Reuse the engine's cached, non-zeroing 2 MiB-aligned staging
+                // buffer. A block WRITE memcpys the whole span and a block READ
+                // fills every sector, so the skipped zero-fill is never observed.
+                io_buf = stagingAcquire(data_len, SPDK_KV_SHIM_DMA_REGION);
                 if (!io_buf) {
                     NIXL_ERROR << "SPDK: block DMA buffer alloc failed (" << data_len << " bytes)";
                     return -ENOMEM;
@@ -776,14 +841,18 @@ nixlSpdkKvEngine::postXferBlock(const nixl_xfer_op_t &operation,
                 if (!use_direct) std::memcpy(io_buf, data_ptr, data_len);
                 r = spdk_kv_shim_write(shim_, io_buf, lba, nlba);
             } else { // NIXL_READ
+                // A block read fills every one of the data_len bytes (nlba full
+                // sectors), so copying the whole span back never exposes the
+                // staging buffer's uninitialized tail (there is none).
                 r = spdk_kv_shim_read(shim_, io_buf, lba, nlba);
                 if (r == 0 && !use_direct) std::memcpy(data_ptr, io_buf, data_len);
             }
-            // Quarantine-aware release: if the op timed out / transport-failed
-            // the shim is poisoned and this quarantines io_buf (freed later at
-            // the fencing teardown) instead of freeing it under a possibly-live
-            // DMA tracker. Covers the demoted staged retry too (run again here).
-            if (!use_direct) spdk_kv_shim_release_io_buf(shim_, io_buf);
+            // Quarantine-aware release: on the healthy path the buffer stays
+            // cached for reuse; if the op timed out / transport-failed the shim is
+            // poisoned and this quarantines io_buf (freed later at the fencing
+            // teardown) and drops it from the cache, instead of recycling a
+            // possibly-live DMA target. Covers the demoted staged retry too.
+            if (!use_direct) stagingRelease(io_buf);
             return r;
         };
 

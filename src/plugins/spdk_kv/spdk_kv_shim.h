@@ -201,6 +201,21 @@ void *spdk_kv_shim_dma_alloc(size_t len);
  */
 void *spdk_kv_shim_dma_alloc_aligned(size_t len, size_t align);
 
+/**
+ * Non-zeroing (raw) variants of the two allocators above, for a STAGING buffer
+ * the caller FULLY INITIALIZES before use. They skip the up-to-64 MiB zero-fill
+ * the zeroing variants pay per staged op, which is safe for staging because a
+ * staged WRITE memcpys the whole span before the Store/write and a staged READ
+ * only ever copies back the bytes the device actually wrote (the cdw0 true length
+ * for a KV Retrieve; the full transfer length for a block read) -- trailing,
+ * never-written bytes never reach the caller. Contract: the caller MUST NOT read
+ * any byte it did not either memcpy in or have the device DMA into. Same
+ * free/release rules as the zeroing variants (spdk_kv_shim_dma_free /
+ * spdk_kv_shim_release_io_buf). NULL on failure.
+ */
+void *spdk_kv_shim_dma_alloc_raw(size_t len);
+void *spdk_kv_shim_dma_alloc_raw_aligned(size_t len, size_t align);
+
 /** Free a buffer returned by spdk_kv_shim_dma_alloc[_aligned](). Safe with NULL.
  *  Use this ONLY for buffers not tied to an in-flight op (e.g. cleaning up after
  *  an alloc failure). To release a per-op STAGING buffer after an op returned,
@@ -220,6 +235,19 @@ void spdk_kv_shim_dma_free(void *buf);
  * closed.
  */
 void spdk_kv_shim_release_io_buf(struct spdk_kv_shim *sh, void *buf);
+
+/**
+ * Is the shim POISONED? True once a prior op timed out or the qpair
+ * transport-failed, leaving a possibly-live DMA tracker: every further op is then
+ * refused (-ESHUTDOWN) until spdk_kv_shim_close(). A caller that CACHES a staging
+ * buffer for reuse queries this after an op to decide the buffer's fate: if
+ * poisoned, the buffer it just used may still be a live DMA target, so it MUST be
+ * handed to spdk_kv_shim_release_io_buf() (which quarantines it) and DROPPED from
+ * the reuse cache -- a quarantined buffer must never be recycled. On the healthy
+ * (not poisoned) path the op's tracker is dead and the buffer may be reused.
+ * Safe with \c sh == NULL (returns false).
+ */
+bool spdk_kv_shim_poisoned(const struct spdk_kv_shim *sh);
 
 /**
  * Make a caller-owned host region [\c vaddr, \c vaddr + \c len) usable DIRECTLY
