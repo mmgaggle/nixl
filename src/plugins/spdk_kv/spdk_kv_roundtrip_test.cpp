@@ -49,6 +49,8 @@
 #include <string>
 #include <vector>
 
+#include <sys/mman.h> // mmap/munmap for the partial-reachability construction
+
 #include "nixl_descriptors.h"
 #include "backend/backend_aux.h"
 #include "spdk_kv_backend.h"
@@ -788,6 +790,99 @@ main(int argc, char **argv) {
         }
         std::cout << "cross-mode guard OK: KV-mode engine refuses BLK_SEG at "
                      "getSupportedMems/registerMem/queryMem\n";
+    }
+
+    // --- Partial DMA-reachability: base fd-backed, tail anonymous (the fix) ---
+    // A multi-region buffer whose BASE region is DMA-reachable but whose TAIL
+    // region is NOT must be classified UNREACHABLE and staged -- NOT latched
+    // zero-copy off the reachable base (which would silently DMA the unreachable
+    // tail over vfio-user: wrong data reported SUCCESS). kv_mem_reachable() walks
+    // the whole [base, len) span region-by-region, so a reachable base no longer
+    // masks an unreachable tail.
+    //
+    // Construct such a buffer as [fd-backed SPDK-DMA 2 MiB region | anonymous
+    // 2 MiB region] laid out contiguously: an anonymous mapping placed at the
+    // 2 MiB boundary immediately after an SPDK-DMA base (MAP_FIXED_NOREPLACE, so
+    // nothing already mapped is disturbed). If that virtual slot is not free
+    // (e.g. it falls inside the DPDK heap reservation), SKIP this check rather
+    // than false-fail -- the construction, not the property under test, is what
+    // could not be set up.
+    {
+#ifdef MAP_FIXED_NOREPLACE
+        const size_t region = SPDK_KV_SHIM_DMA_REGION; // 2 MiB
+        void *base = spdk_kv_shim_dma_alloc_aligned(region, region); // fd-backed
+        bool skipped = true;
+        if (base != nullptr) {
+            void *tail_at = static_cast<void *>(static_cast<uint8_t *>(base) + region);
+            void *tail = mmap(tail_at, region, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+            if (tail == tail_at) {
+                skipped = false;
+                const size_t sz = 2 * region; // fd-backed base + anonymous tail
+                auto *bb = static_cast<uint8_t *>(base);
+                for (size_t i = 0; i < sz; ++i) bb[i] = static_cast<uint8_t>(i * 131u + 17u);
+                std::vector<uint8_t> expect(bb, bb + sz);
+                const uint64_t dram_dev = 0, key_dev = 1;
+                const std::string key = "nixl-partial-001"; // 16 bytes, opaque
+
+                nixlBlobDesc src_desc(reinterpret_cast<uintptr_t>(base), sz, dram_dev, "");
+                nixlBackendMD *src_md = nullptr;
+                nixlBlobDesc key_desc(0, sz, key_dev, key);
+                nixlBackendMD *key_md = nullptr;
+                int rc = 1;
+                if (eng.registerMem(src_desc, DRAM_SEG, src_md) != NIXL_SUCCESS ||
+                    eng.registerMem(key_desc, OBJ_SEG, key_md) != NIXL_SUCCESS) {
+                    std::cerr << "FAIL: registerMem (partial-reachability) failed\n";
+                } else if (eng.dramIsDmaRegistered(src_md)) {
+                    std::cerr << "FAIL: a base-reachable/tail-unreachable buffer was marked "
+                                 "zero-copy -- the span walk did not catch the unreachable "
+                                 "tail (would silently transfer wrong data over vfio-user)\n";
+                } else {
+                    // Staged path: a byte-exact WRITE then READ round-trip proves the
+                    // fallback moves the FULL span correctly (no silent corruption).
+                    nixl_meta_dlist_t local(DRAM_SEG);
+                    local.addDesc(nixlMetaDesc(reinterpret_cast<uintptr_t>(base), sz, dram_dev, src_md));
+                    nixl_meta_dlist_t remote(OBJ_SEG);
+                    remote.addDesc(nixlMetaDesc(0, sz, key_dev, key_md));
+                    nixlBackendReqH *h = nullptr;
+                    bool round_ok = false;
+                    if (eng.prepXfer(NIXL_WRITE, local, remote, init.localAgent, h) == NIXL_SUCCESS) {
+                        eng.postXfer(NIXL_WRITE, local, remote, init.localAgent, h);
+                        round_ok = checkComplete(eng, h);
+                    }
+                    eng.releaseReqH(h);
+                    std::memset(base, 0, sz);
+                    h = nullptr;
+                    if (round_ok &&
+                        eng.prepXfer(NIXL_READ, local, remote, init.localAgent, h) == NIXL_SUCCESS) {
+                        eng.postXfer(NIXL_READ, local, remote, init.localAgent, h);
+                        round_ok = checkComplete(eng, h);
+                    }
+                    eng.releaseReqH(h);
+                    rc = (round_ok && std::memcmp(base, expect.data(), sz) == 0) ? 0 : 2;
+                }
+                eng.deregisterMem(key_md);
+                eng.deregisterMem(src_md);
+                munmap(tail, region);
+                if (rc != 0) {
+                    std::cerr << "FAIL: partial-reachability staged round-trip (rc=" << rc << ")\n";
+                    spdk_kv_shim_dma_free(base);
+                    return 1;
+                }
+                std::cout << "partial-reachability OK: fd-backed base + anonymous tail "
+                             "classified unreachable, staged byte-exact (no silent corruption)\n";
+            } else if (tail != MAP_FAILED) {
+                munmap(tail, region);
+            }
+            spdk_kv_shim_dma_free(base);
+        }
+        if (skipped) {
+            std::cout << "partial-reachability check SKIPPED: no free virtual slot after the "
+                         "SPDK-DMA base to place an anonymous tail\n";
+        }
+#else
+        std::cout << "partial-reachability check SKIPPED: MAP_FIXED_NOREPLACE unavailable\n";
+#endif
     }
 
     std::cout << "spdk_kv_roundtrip_test: PASS\n";

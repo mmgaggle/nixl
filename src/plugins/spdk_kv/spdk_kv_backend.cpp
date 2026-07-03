@@ -473,79 +473,83 @@ nixlSpdkKvEngine::postXfer(const nixl_xfer_op_t &operation,
             continue;
         }
 
-        // Zero-copy: when the local DRAM was DMA-registered in registerMem, hand
-        // the caller's buffer straight to the shim (no alloc, no memcpy). When it
-        // was not (unaligned / unregisterable), stage through an SPDK-DMA buffer
-        // and copy -- always correct, just a copy. The region-bounded SGL walks
-        // whichever buffer we pass. prepXfer guarantees the local seg is DRAM_SEG
-        // and registerMem always builds a nixlSpdkKvDramMD for DRAM_SEG, so the
-        // local MD type is statically known -- static_cast. The nullptr guard
-        // still covers a descriptor registered with no MD (staged path).
+        // Zero-copy vs staged, WITH DEMOTION. When the local DRAM was
+        // DMA-registered in registerMem, hand the caller's buffer straight to the
+        // shim (no alloc, no memcpy). When it was not (unaligned / unregisterable
+        // / only partially reachable), stage through an SPDK-DMA buffer and copy
+        // -- always correct, just a copy. A direct-path SUBMIT/reachability
+        // failure (a negative shim rc, e.g. a region-bounded SGL descriptor whose
+        // vaddr is not DMA-translatable) is NOT fatal: demote to the
+        // always-correct staged copy for THIS descriptor rather than failing the
+        // transfer. A device-reported status (non-negative rc, incl. the
+        // BUFFER_TOO_SMALL auto-sizing signal) is a real answer and is never
+        // demoted. prepXfer guarantees the local seg is DRAM_SEG and registerMem
+        // always builds a nixlSpdkKvDramMD for DRAM_SEG, so the local MD type is
+        // statically known -- static_cast; the nullptr guard still covers a
+        // descriptor registered with no MD (staged path).
         auto *dram = static_cast<nixlSpdkKvDramMD *>(local_desc.metadataP);
         const bool direct = dram != nullptr && dram->dma_registered;
-        void *io_buf = data_ptr;
-        if (!direct) {
-            io_buf = spdk_kv_shim_dma_alloc(data_len);
-            if (!io_buf) {
-                NIXL_ERROR << "SPDK_KV: DMA buffer alloc failed (" << data_len << " bytes)";
-                req_h->status = NIXL_ERR_BACKEND;
-                return NIXL_ERR_BACKEND;
-            }
-        }
 
-        int rc = 0;
-        if (operation == NIXL_WRITE) {
-            if (!direct) std::memcpy(io_buf, data_ptr, data_len);
-            rc = spdk_kv_shim_store(shim_,
-                                    key.data(),
-                                    static_cast<uint8_t>(key.size()),
-                                    io_buf,
-                                    static_cast<uint32_t>(data_len));
-            if (rc != 0) {
-                NIXL_ERROR << "SPDK_KV: spdk_kv_shim_store failed: rc=" << rc;
+        // Device TRUE value length for a READ (value auto-sizing); set by run_kv.
+        uint32_t value_len_out = 0;
+        // One attempt of the KV op over either the caller's buffer (use_direct)
+        // or a freshly staged SPDK-DMA copy. Returns the shim rc, or -ENOMEM if
+        // the staging allocation fails. On a READ that fits (rc==0) the staged
+        // copy is written back to the caller here.
+        auto run_kv = [&](bool use_direct) -> int {
+            void *io_buf = data_ptr;
+            if (!use_direct) {
+                io_buf = spdk_kv_shim_dma_alloc(data_len);
+                if (!io_buf) {
+                    NIXL_ERROR << "SPDK_KV: DMA buffer alloc failed (" << data_len << " bytes)";
+                    return -ENOMEM;
+                }
             }
-        } else { // NIXL_READ
-            uint32_t value_len_out = 0;
-            rc = spdk_kv_shim_retrieve(shim_,
-                                       key.data(),
+            int r;
+            if (operation == NIXL_WRITE) {
+                if (!use_direct) std::memcpy(io_buf, data_ptr, data_len);
+                r = spdk_kv_shim_store(shim_, key.data(),
                                        static_cast<uint8_t>(key.size()),
-                                       io_buf,
-                                       static_cast<uint32_t>(data_len),
-                                       &value_len_out);
-            if (rc == 0) {
+                                       io_buf, static_cast<uint32_t>(data_len));
+            } else { // NIXL_READ
+                r = spdk_kv_shim_retrieve(shim_, key.data(),
+                                          static_cast<uint8_t>(key.size()),
+                                          io_buf, static_cast<uint32_t>(data_len),
+                                          &value_len_out);
                 // The whole value fit: value_len_out is the device's TRUE value
-                // length and is <= data_len. In direct mode the device already
-                // DMA'd exactly value_len_out bytes into the caller's buffer; in
-                // staged mode copy exactly those bytes back. Either way a value
-                // shorter than the buffer leaves the caller's tail untouched (we
-                // never over-read/over-copy).
-                if (!direct) std::memcpy(data_ptr, io_buf, value_len_out);
-            } else if (rc == SPDK_KV_SHIM_SC_BUFFER_TOO_SMALL) {
-                // Value auto-sizing: the stored value is larger than the host
-                // buffer, so value_len_out is the TRUE length. Do NOT surface a
-                // truncated value: record the true length so the caller can
-                // resize its buffer/descriptor and re-Retrieve, and report a
-                // distinct MISMATCH status (not a generic backend error).
-                // Retrieved via getReqTrueLen(handle, i). NOTE (zero-copy): in
-                // direct mode the device may have written up to data_len partial
-                // bytes into the caller's buffer; per the shim contract those
-                // contents are unusable and the resize+retry overwrites them.
-                req_h->true_lens[i] = value_len_out;
-                NIXL_WARN << "SPDK_KV: value (" << value_len_out
-                          << " B) exceeds host buffer (" << data_len
-                          << " B) for descriptor " << i
-                          << "; reporting true length for resize+retry";
-                if (!direct) spdk_kv_shim_dma_free(io_buf);
-                req_h->status = NIXL_ERR_MISMATCH;
-                return NIXL_ERR_MISMATCH;
-            } else {
-                NIXL_ERROR << "SPDK_KV: spdk_kv_shim_retrieve failed: rc=" << rc;
+                // length and is <= data_len. In staged mode copy exactly those
+                // bytes back; a value shorter than the buffer leaves the caller's
+                // tail untouched (we never over-read/over-copy).
+                if (r == 0 && !use_direct) std::memcpy(data_ptr, io_buf, value_len_out);
             }
+            if (!use_direct) spdk_kv_shim_dma_free(io_buf);
+            return r;
+        };
+
+        int rc = run_kv(direct);
+        if (direct && rc < 0) {
+            NIXL_WARN << "SPDK_KV: direct DMA failed for descriptor " << i
+                      << " (rc=" << rc << "); demoting to a staged copy";
+            rc = run_kv(false);
         }
 
-        if (!direct) spdk_kv_shim_dma_free(io_buf);
-
+        if (operation == NIXL_READ && rc == SPDK_KV_SHIM_SC_BUFFER_TOO_SMALL) {
+            // Value auto-sizing: the stored value is larger than the host buffer,
+            // so value_len_out is the TRUE length. Do NOT surface a truncated
+            // value: record the true length so the caller can resize its
+            // buffer/descriptor and re-Retrieve, and report a distinct MISMATCH
+            // status (not a generic backend error). Retrieved via
+            // getReqTrueLen(handle, i).
+            req_h->true_lens[i] = value_len_out;
+            NIXL_WARN << "SPDK_KV: value (" << value_len_out
+                      << " B) exceeds host buffer (" << data_len
+                      << " B) for descriptor " << i
+                      << "; reporting true length for resize+retry";
+            req_h->status = NIXL_ERR_MISMATCH;
+            return NIXL_ERR_MISMATCH;
+        }
         if (rc != 0) {
+            NIXL_ERROR << "SPDK_KV: descriptor " << i << " transfer failed: rc=" << rc;
             req_h->status = NIXL_ERR_BACKEND;
             return NIXL_ERR_BACKEND;
         }
@@ -659,41 +663,48 @@ nixlSpdkKvEngine::postXferBlock(const nixl_xfer_op_t &operation,
         // 4 KiB-aligned) buffer at each 2 MiB boundary, so neither path lets a
         // descriptor straddle two independently-mapped vfio-user regions (up to
         // the ~64 MiB single-op bound). NO value auto-sizing (block moves exactly
-        // len bytes). prepXfer guarantees the local seg is DRAM_SEG and
-        // registerMem always builds a nixlSpdkKvDramMD for DRAM_SEG, so the local
-        // MD type is statically known -- static_cast. The nullptr guard still
-        // covers a descriptor registered with no MD (staged path).
+        // len bytes). Zero-copy vs staged, WITH DEMOTION (mirrors the KV path): a
+        // direct-path submit/reachability failure (negative rc) demotes to the
+        // always-correct staged copy for THIS descriptor rather than failing the
+        // transfer. prepXfer guarantees the local seg is DRAM_SEG and registerMem
+        // always builds a nixlSpdkKvDramMD for DRAM_SEG, so the local MD type is
+        // statically known -- static_cast; the nullptr guard still covers a
+        // descriptor registered with no MD (staged path).
         auto *dram = static_cast<nixlSpdkKvDramMD *>(local_desc.metadataP);
         const bool direct = dram != nullptr && dram->dma_registered;
-        void *io_buf = data_ptr;
-        if (!direct) {
-            io_buf = spdk_kv_shim_dma_alloc_aligned(data_len, SPDK_KV_SHIM_DMA_REGION);
-            if (!io_buf) {
-                NIXL_ERROR << "SPDK: block DMA buffer alloc failed (" << data_len << " bytes)";
-                req_h->status = NIXL_ERR_BACKEND;
-                return NIXL_ERR_BACKEND;
+
+        // One attempt of the block op over either the caller's buffer
+        // (use_direct) or a 2 MiB-aligned staged SPDK-DMA copy. Returns the shim
+        // rc, or -ENOMEM if the staging allocation fails.
+        auto run_blk = [&](bool use_direct) -> int {
+            void *io_buf = data_ptr;
+            if (!use_direct) {
+                io_buf = spdk_kv_shim_dma_alloc_aligned(data_len, SPDK_KV_SHIM_DMA_REGION);
+                if (!io_buf) {
+                    NIXL_ERROR << "SPDK: block DMA buffer alloc failed (" << data_len << " bytes)";
+                    return -ENOMEM;
+                }
             }
+            int r;
+            if (operation == NIXL_WRITE) {
+                if (!use_direct) std::memcpy(io_buf, data_ptr, data_len);
+                r = spdk_kv_shim_write(shim_, io_buf, lba, nlba);
+            } else { // NIXL_READ
+                r = spdk_kv_shim_read(shim_, io_buf, lba, nlba);
+                if (r == 0 && !use_direct) std::memcpy(data_ptr, io_buf, data_len);
+            }
+            if (!use_direct) spdk_kv_shim_dma_free(io_buf);
+            return r;
+        };
+
+        int rc = run_blk(direct);
+        if (direct && rc < 0) {
+            NIXL_WARN << "SPDK: direct DMA failed for block descriptor " << i
+                      << " (rc=" << rc << "); demoting to a staged copy";
+            rc = run_blk(false);
         }
-
-        int rc = 0;
-        if (operation == NIXL_WRITE) {
-            if (!direct) std::memcpy(io_buf, data_ptr, data_len);
-            rc = spdk_kv_shim_write(shim_, io_buf, lba, nlba);
-            if (rc != 0) {
-                NIXL_ERROR << "SPDK: spdk_kv_shim_write failed: rc=" << rc;
-            }
-        } else { // NIXL_READ
-            rc = spdk_kv_shim_read(shim_, io_buf, lba, nlba);
-            if (rc == 0) {
-                if (!direct) std::memcpy(data_ptr, io_buf, data_len);
-            } else {
-                NIXL_ERROR << "SPDK: spdk_kv_shim_read failed: rc=" << rc;
-            }
-        }
-
-        if (!direct) spdk_kv_shim_dma_free(io_buf);
-
         if (rc != 0) {
+            NIXL_ERROR << "SPDK: block descriptor " << i << " transfer failed: rc=" << rc;
             req_h->status = NIXL_ERR_BACKEND;
             return NIXL_ERR_BACKEND;
         }

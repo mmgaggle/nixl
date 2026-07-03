@@ -31,6 +31,7 @@
 #include "spdk/nvme.h"
 #include "spdk/nvme_kv.h"
 #include "spdk/nvme_spec.h"
+#include "spdk/util.h"	/* spdk_divide_round_up(), SPDK_ALIGN_FLOOR() */
 
 #include "spdk_kv_shim.h"
 
@@ -372,32 +373,82 @@ spdk_kv_shim_dma_free(void *buf)
 }
 
 /*
- * Is [vaddr, vaddr+len) DMA-reachable by this shim's transport RIGHT NOW? The
- * check is transport-specific:
- *   - vfio-user: the target maps client memory by fd, so the region must be
+ * Is EVERY 2 MiB region across [vaddr, vaddr+len) DMA-reachable by this shim's
+ * transport RIGHT NOW? Reachability is a RANGE property, not a point property:
+ * the region-bounded SGL emits one data-block descriptor per 2 MiB region, so a
+ * buffer is usable directly only when EACH region is reachable. Walking the whole
+ * span (rather than probing only the base) is a correctness requirement -- a
+ * buffer whose base is reachable but whose tail is not must be reported
+ * unreachable, or a zero-copy transfer would silently DMA the unreachable tail
+ * (over vfio-user the raw VA passes through unchecked -> wrong data reported
+ * SUCCESS; over PCIE the op fails with no fallback).
+ *
+ * The check is transport-specific:
+ *   - vfio-user: the target maps client memory by fd, so every region must be
  *     fd-backed (spdk_mem_get_fd_and_offset() returns an fd). Anonymous DRAM is
  *     not reachable even after spdk_mem_register() (its DMA-map notify fails).
- *   - PCIE / IOMMU (or unknown): reachable iff spdk_vtophys() can translate it,
- *     which spdk_mem_register() arranges by pinning + IOMMU-mapping the pages.
- * Probes the base address; SPDK-DMA and freshly-registered regions are
- * contiguous, and a mid-transfer translation gap fails the op cleanly (lib/nvme
- * bad-vtophys) rather than corrupting data.
+ *     Probe the base and each 2 MiB region boundary the span crosses.
+ *   - PCIE / IOMMU (or unknown): reachable iff spdk_vtophys() can translate every
+ *     page, which spdk_mem_register() arranges by pinning + IOMMU-mapping the
+ *     pages. spdk_vtophys() reports the contiguous-translatable length in its size
+ *     out-param; advance by it and re-probe until the whole span is covered.
  */
 static bool
 kv_mem_reachable(const struct spdk_kv_shim *sh, const void *vaddr, size_t len)
 {
 	const struct spdk_nvme_transport_id *trid;
+	uintptr_t start, end, probe;
 
 	if (sh == NULL || sh->ctrlr == NULL || vaddr == NULL || len == 0) {
 		return false;
 	}
+	start = (uintptr_t)vaddr;
+	end = start + len;
+	/* Reject an address-space wrap from a bogus (vaddr, len). */
+	if (end < start) {
+		return false;
+	}
+
 	trid = spdk_nvme_ctrlr_get_transport_id(sh->ctrlr);
 	if (trid != NULL && trid->trtype == SPDK_NVME_TRANSPORT_VFIOUSER) {
-		uint64_t off = 0;
-		return spdk_mem_get_fd_and_offset((void *)(uintptr_t)vaddr, &off) >= 0;
+		/*
+		 * Probe fd-backing at the base and at every 2 MiB region boundary
+		 * the span crosses; the span is reachable only if EVERY region is
+		 * fd-backed. Different regions may live in different memsegs (and
+		 * thus carry different fds) -- that is fine, the target maps each
+		 * region independently, so only per-region fd-backing is required,
+		 * not a single consistent fd across the span.
+		 */
+		for (probe = start; probe < end;
+		     probe = SPDK_ALIGN_FLOOR(probe, SPDK_KV_SHIM_DMA_REGION) +
+			     SPDK_KV_SHIM_DMA_REGION) {
+			uint64_t off = 0;
+
+			if (spdk_mem_get_fd_and_offset((void *)probe, &off) < 0) {
+				return false;
+			}
+		}
+		return true;
 	}
-	uint64_t sz = len;
-	return spdk_vtophys(vaddr, &sz) != SPDK_VTOPHYS_ERROR;
+
+	/*
+	 * PCIE / IOMMU (or unknown): spdk_vtophys() returns the length over which
+	 * the translation stays valid and physically contiguous (capped at the
+	 * requested size). Advance by that returned length so a translation gap
+	 * ANYWHERE in the span -- not just at the base -- is caught. On success the
+	 * step is > 0; the sz == 0 guard only defends against an unexpected
+	 * zero-length step so the loop cannot spin.
+	 */
+	for (probe = start; probe < end;) {
+		uint64_t sz = (uint64_t)(end - probe);
+
+		if (spdk_vtophys((const void *)probe, &sz) == SPDK_VTOPHYS_ERROR ||
+		    sz == 0) {
+			return false;
+		}
+		probe += sz;
+	}
+	return true;
 }
 
 int
@@ -522,8 +573,8 @@ kv_region_count(const void *base, uint32_t len)
 	if ((uint64_t)len <= first) {
 		return 1;
 	}
-	return 1u + (uint32_t)(((uint64_t)len - first + SPDK_KV_SHIM_DMA_REGION - 1) /
-			       SPDK_KV_SHIM_DMA_REGION);
+	return 1u + (uint32_t)spdk_divide_round_up((uint64_t)len - first,
+						   SPDK_KV_SHIM_DMA_REGION);
 }
 
 /* SGL iterator: restart the walk at \c offset (lib/nvme may re-drive it). */
