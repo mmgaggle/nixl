@@ -128,7 +128,9 @@ and **disables the PCIe SGL merge** so each segment becomes its own descriptor �
 the vfio-user target maps each 2 MiB region independently, so a single descriptor
 must **not** cross a region boundary. The descriptor count is bounded by the target's
 `NVMF_REQ_MAX_BUFFERS` (`SPDK_NVMF_MAX_SGL_ENTRIES*2+1 = 33`), which caps a
-single op at ~64 MiB (matching the vfio-user target's default `max_io_size`).
+single op at ~64 MiB (32 full 2 MiB regions plus a partial first region). This
+iovec budget — not the transport's `max_io_size` (128 KiB by default) — is the
+real single-op ceiling.
 
 **No striping — a hard design decision.** A value that would need more than the
 region budget is **rejected** (`NIXL_ERR_INVALID_PARAM`, before any DMA is
