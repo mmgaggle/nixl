@@ -224,8 +224,8 @@ private:
     // Ratified maximum NVMe-KV inline key length (bytes).
     static constexpr uint8_t kMaxKeyLen = 16;
 
-    // Block (BLK_SEG) helpers. Dispatched from prep/postXfer when the remote
-    // memory type is BLK_SEG; the OBJ_SEG (KV) path is unchanged.
+    // Block (BLK_SEG) helpers. Dispatched when the remote memory type is
+    // BLK_SEG; the OBJ_SEG (KV) path is unchanged.
     //
     // computeBlockRange: derive the LBA (remote.addr) and sector count for one
     // descriptor pair, enforcing the block semantics -- local/remote byte
@@ -233,15 +233,19 @@ private:
     // size, the length must not exceed the region-bounded single-op bound
     // (~64 MiB; NO striping), and [LBA, LBA+nlba) must fit the namespace
     // capacity. A zero-length descriptor yields nlba_out == 0 (a no-op the
-    // caller skips). Returns NIXL_ERR_INVALID_PARAM on any violation.
+    // caller skips). Returns NIXL_ERR_INVALID_PARAM on any violation. Called from
+    // prepXfer, which validates and stashes every range on the request handle
+    // before any DMA; postXferBlock then consumes the stashed ranges.
     nixl_status_t
     computeBlockRange(const nixlMetaDesc &local_desc,
                       const nixlMetaDesc &remote_desc,
                       uint64_t &lba_out,
                       uint32_t &nlba_out) const;
 
-    // postXferBlock: stage through a region-aligned SPDK DMA buffer and issue
-    // spdk_kv_shim_write (WRITE) / spdk_kv_shim_read (READ) per descriptor.
+    // postXferBlock: issue the prepXfer-validated LBA ranges (carried on the
+    // request handle) -- stage through a region-aligned SPDK DMA buffer, or DMA
+    // straight to/from the caller's buffer, then spdk_kv_shim_write (WRITE) /
+    // spdk_kv_shim_read (READ) per descriptor. No range recompute.
     nixl_status_t
     postXferBlock(const nixl_xfer_op_t &operation,
                   const nixl_meta_dlist_t &local,

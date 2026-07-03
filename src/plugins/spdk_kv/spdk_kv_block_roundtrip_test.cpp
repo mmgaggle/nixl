@@ -640,11 +640,14 @@ main(int argc, char **argv) {
             return 1;
         }
 
-        // postXfer of an OBJ_SEG remote must be refused BEFORE any device op. The
-        // remote carries a nullptr KV-key metadata, so had the mode guard NOT
-        // fired first the KV path would instead fail with INVALID_PARAM (missing
-        // metadata); asserting exactly NIXL_ERR_NOT_SUPPORTED proves the guard
-        // refused it up front, before touching the device.
+        // A cross-mode OBJ_SEG remote must be refused BEFORE any device op. prep
+        // now rejects a cross-mode list up front (defense-in-depth), so the
+        // refusal surfaces at prepXfer; if it did not, it must still surface at
+        // postXfer before any device op. Either way the FIRST non-success stage
+        // must be exactly NIXL_ERR_NOT_SUPPORTED, and no device op runs (a prep
+        // refusal means postXfer is never reached). The remote carries a nullptr
+        // KV-key metadata, so a non-mode error would surface as INVALID_PARAM
+        // instead -- asserting NOT_SUPPORTED proves the mode guard fired first.
         std::vector<uint8_t> buf(4096, 0);
         nixlBlobDesc dram_desc(reinterpret_cast<uintptr_t>(buf.data()), buf.size(), 0, "");
         nixlBackendMD *dram_md = nullptr;
@@ -666,14 +669,19 @@ main(int argc, char **argv) {
             eng.releaseReqH(h);
         }
         eng.deregisterMem(dram_md);
-        if (ps != NIXL_ERR_NOT_SUPPORTED) {
-            std::cerr << "FAIL: postXfer(OBJ_SEG) on a block engine was not refused with "
-                         "NIXL_ERR_NOT_SUPPORTED (prep=" << pp << " post=" << ps
-                      << " check=" << cs << ")\n";
+        // The FIRST stage that did not succeed carries the reject reason; refusal
+        // at prep means post/check never ran (no device op).
+        const nixl_status_t first_fail = (pp != NIXL_SUCCESS) ? pp
+                                       : (ps != NIXL_SUCCESS) ? ps
+                                                              : cs;
+        if (first_fail != NIXL_ERR_NOT_SUPPORTED) {
+            std::cerr << "FAIL: OBJ_SEG on a block engine was not refused with "
+                         "NIXL_ERR_NOT_SUPPORTED before any device op (prep=" << pp
+                      << " post=" << ps << " check=" << cs << ")\n";
             return 1;
         }
         std::cout << "cross-mode guard OK: block-mode engine refuses OBJ_SEG at "
-                     "getSupportedMems/registerMem/queryMem/postXfer (no wild-LBA KV op)\n";
+                     "getSupportedMems/registerMem/queryMem/prepXfer (no wild-LBA KV op)\n";
     }
 
     std::cout << "spdk_kv_block_roundtrip_test: PASS\n";

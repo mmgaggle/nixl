@@ -75,12 +75,27 @@ public:
     nixlSpdkKvBackendReqH() = default;
     ~nixlSpdkKvBackendReqH() override = default;
 
+    // A validated block (BLK_SEG) LBA range: one per descriptor, computed and
+    // range-checked in prepXfer and consumed verbatim by postXferBlock.
+    struct BlockRange {
+        uint64_t lba = 0;
+        uint32_t nlba = 0;
+    };
+
     nixl_status_t status = NIXL_IN_PROG;
-    // Value auto-sizing: per-descriptor device TRUE value length recorded when a
-    // READ's host buffer was too small (status == NIXL_ERR_MISMATCH). Sized to
-    // the descriptor count in postXfer; 0 means "no too-small result recorded"
-    // (the READ fit, or this descriptor was not reached). Read by getReqTrueLen.
-    std::vector<size_t> true_lens;
+    // Value auto-sizing: the device's TRUE value length recorded when a READ's
+    // host buffer was too small (status == NIXL_ERR_MISMATCH). postXfer returns
+    // at the FIRST too-small descriptor, so at most one is ever recorded -- a
+    // scalar, not a per-descriptor vector. true_len_desc is that descriptor's
+    // index; -1 means "no too-small result recorded" (the READ fit, or none was
+    // reached). Read by getReqTrueLen, which returns true_len iff idx matches.
+    size_t true_len = 0;
+    int true_len_desc = -1;
+    // Block path: the per-descriptor LBA ranges validated in prepXfer. Filled for
+    // a BLK_SEG transfer and consumed by postXferBlock so it issues the pre-
+    // validated IO instead of recomputing computeBlockRange per descriptor
+    // (mirrors gusli, which builds the block IO at prep). Empty for the KV path.
+    std::vector<BlockRange> block_ranges;
 };
 
 // Parse "true"/"1"/"yes"/"on" (case-insensitive) as boolean true.
@@ -369,24 +384,87 @@ nixlSpdkKvEngine::prepXfer(const nixl_xfer_op_t &operation,
         NIXL_ERROR << "SPDK: remote memory type must be OBJ_SEG or BLK_SEG, got " << remote_type;
         return NIXL_ERR_INVALID_PARAM;
     }
+    // Cross-mode guard at prep: the remote op-set must match the bound namespace
+    // kind, refused BEFORE any DMA (defense-in-depth alongside the postXfer and
+    // registerMem guards). OBJ_SEG on a block-bound engine would alias a KV Store
+    // to an NVM WRITE at a wild LBA; BLK_SEG on a KV-bound engine is equally
+    // invalid. Refusing malformed-mode lists here keeps prep and post in lockstep.
+    if ((remote_type == OBJ_SEG && blockMode_) || (remote_type == BLK_SEG && !blockMode_)) {
+        NIXL_ERROR << "SPDK: remote memory type " << remote_type
+                   << " does not match the engine's namespace kind; rejecting";
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
     if (local.descCount() != remote.descCount()) {
         NIXL_ERROR << "SPDK_KV: local/remote descriptor count mismatch";
         return NIXL_ERR_INVALID_PARAM;
     }
+    if (!shim_) {
+        NIXL_ERROR << "SPDK: shim not initialized";
+        return NIXL_ERR_BACKEND;
+    }
 
+    // Validate EVERY descriptor up front, before any device op, so a multi-
+    // descriptor list with one malformed descriptor is rejected atomically at
+    // prep -- postXfer then issues ZERO device ops (no mid-list partial mutation
+    // where an earlier descriptor is durably Stored/written and a later one fails
+    // with no rollback).
     if (remote_type == BLK_SEG) {
-        // Validate every LBA range (alignment/capacity/single-range) up front so
-        // a malformed block transfer is rejected at prep, before postXfer stages
-        // any DMA (mirrors gusli, which builds the block IO in prepXfer).
-        if (!shim_) {
-            NIXL_ERROR << "SPDK: shim not initialized";
-            return NIXL_ERR_BACKEND;
-        }
+        // Block: derive and range-check (length match, sector alignment, single-op
+        // bound, capacity) every LBA range, then STASH it so postXferBlock issues
+        // the validated IO rather than recomputing (mirrors gusli's prep-built IO).
+        std::vector<nixlSpdkKvBackendReqH::BlockRange> ranges(local.descCount());
         for (int i = 0; i < local.descCount(); ++i) {
             uint64_t lba = 0;
             uint32_t nlba = 0;
             nixl_status_t vs = computeBlockRange(local[i], remote[i], lba, nlba);
             if (vs != NIXL_SUCCESS) return vs;
+            ranges[i].lba = lba;
+            ranges[i].nlba = nlba;
+        }
+        auto *req_h = new nixlSpdkKvBackendReqH();
+        req_h->block_ranges = std::move(ranges);
+        handle = req_h;
+        return NIXL_SUCCESS;
+    }
+
+    // KV (OBJ_SEG): validate length match, the single-op bound (no striping), and
+    // the key-metadata presence/length for every descriptor. These checks used to
+    // live inside the postXfer loop, which validated-and-issued per iteration --
+    // the source of the mid-list partial Store. Run them all here so a bad
+    // descriptor is caught before the first Store/Retrieve.
+    const uint32_t max_op = spdk_kv_shim_max_value_len_op(shim_);
+    for (int i = 0; i < local.descCount(); ++i) {
+        const auto &local_desc = local[i];
+        const auto &remote_desc = remote[i];
+
+        // A local/remote length mismatch means the caller's view of the value
+        // size disagrees; fail rather than Store/Retrieve a different byte count.
+        if (local_desc.len != remote_desc.len) {
+            NIXL_ERROR << "SPDK_KV: descriptor " << i << " length mismatch: local="
+                       << local_desc.len << " remote=" << remote_desc.len;
+            return NIXL_ERR_INVALID_PARAM;
+        }
+        // NO striping: a value past the single-op region-bounded SGL bound is
+        // rejected here, never split across ops.
+        if (local_desc.len > max_op) {
+            NIXL_ERROR << "SPDK_KV: descriptor " << i << " length " << local_desc.len
+                       << " exceeds the single-op bound " << max_op
+                       << " bytes; rejecting (no striping)";
+            return NIXL_ERR_INVALID_PARAM;
+        }
+        // The verbatim inline key lives in the descriptor's registration metadata
+        // (built and length-checked in registerMem). Require it to be present and
+        // still within [1, maxKeyLen_] so postXfer can take it as-is.
+        auto *md = static_cast<nixlSpdkKvMetadata *>(remote_desc.metadataP);
+        if (!md) {
+            NIXL_ERROR << "SPDK_KV: remote descriptor " << i
+                       << " has no registered KV-key metadata";
+            return NIXL_ERR_INVALID_PARAM;
+        }
+        if (md->key.empty() || md->key.size() > maxKeyLen_) {
+            NIXL_ERROR << "SPDK_KV: remote descriptor " << i << " has invalid key length "
+                       << md->key.size();
+            return NIXL_ERR_INVALID_PARAM;
         }
     }
 
@@ -433,27 +511,22 @@ nixlSpdkKvEngine::postXfer(const nixl_xfer_op_t &operation,
         return postXferBlock(operation, local, remote, handle);
     }
     auto *req_h = static_cast<nixlSpdkKvBackendReqH *>(handle);
-    // One true-length slot per descriptor for value auto-sizing (all 0 until a
-    // READ reports a too-small host buffer).
-    req_h->true_lens.assign(local.descCount(), 0);
+    // Value auto-sizing state: no too-small result yet (getReqTrueLen -> 0). Set
+    // to (true_len, i) only if a READ reports the host buffer was too small.
+    req_h->true_len = 0;
+    req_h->true_len_desc = -1;
 
     for (int i = 0; i < local.descCount(); ++i) {
         const auto &local_desc = local[i];
         const auto &remote_desc = remote[i];
 
-        // The op uses the local length for the DMA buffer (staged or direct) and
-        // the KV value size; a local/remote length mismatch means the caller's
-        // view of the value size disagrees, so fail rather than store/retrieve a
-        // different number of bytes.
-        if (local_desc.len != remote_desc.len) {
-            NIXL_ERROR << "SPDK_KV: descriptor " << i << " length mismatch: local="
-                       << local_desc.len << " remote=" << remote_desc.len;
-            req_h->status = NIXL_ERR_INVALID_PARAM;
-            return NIXL_ERR_INVALID_PARAM;
-        }
-
-        // The KV key lives in the descriptor's registration metadata (set by
-        // registerMem). Read it from there rather than re-deriving.
+        // prepXfer already validated EVERY descriptor (length match, single-op
+        // bound, key-metadata presence/length) BEFORE this loop, so a malformed
+        // mid-list descriptor was rejected up front and NO Store/Retrieve has run
+        // for this list -- there is no mid-list partial mutation. The read below
+        // takes the pre-validated key from the descriptor's registration
+        // metadata; the nullptr check is a defensive deref guard (prep guarantees
+        // it holds for every descriptor), not a mid-list validation reject.
         auto *md = static_cast<nixlSpdkKvMetadata *>(remote_desc.metadataP);
         if (!md) {
             NIXL_ERROR << "SPDK_KV: remote descriptor " << i
@@ -465,19 +538,6 @@ nixlSpdkKvEngine::postXfer(const nixl_xfer_op_t &operation,
 
         const auto data_ptr = reinterpret_cast<void *>(local_desc.addr);
         const size_t data_len = local_desc.len;
-
-        // NO striping: a value larger than the single-op region-bounded SGL
-        // bound (~64 MiB) is out of scope and REJECTED here, before staging any
-        // DMA, rather than being split across ops. The KV-cache use case sizes
-        // its blocks (tokens_per_block) so one value = one op.
-        const uint32_t max_op = spdk_kv_shim_max_value_len_op(shim_);
-        if (data_len > max_op) {
-            NIXL_ERROR << "SPDK_KV: descriptor " << i << " length " << data_len
-                       << " exceeds the single-op bound " << max_op
-                       << " bytes; rejecting (no striping)";
-            req_h->status = NIXL_ERR_INVALID_PARAM;
-            return NIXL_ERR_INVALID_PARAM;
-        }
 
         // A zero-length descriptor carries no value bytes. Treat it as a
         // successful no-op rather than routing spdk_dma_zmalloc(0) (which may
@@ -559,7 +619,8 @@ nixlSpdkKvEngine::postXfer(const nixl_xfer_op_t &operation,
             // buffer/descriptor and re-Retrieve, and report a distinct MISMATCH
             // status (not a generic backend error). Retrieved via
             // getReqTrueLen(handle, i).
-            req_h->true_lens[i] = value_len_out;
+            req_h->true_len = value_len_out;
+            req_h->true_len_desc = i;
             NIXL_WARN << "SPDK_KV: value (" << value_len_out
                       << " B) exceeds host buffer (" << data_len
                       << " B) for descriptor " << i
@@ -651,21 +712,27 @@ nixlSpdkKvEngine::postXferBlock(const nixl_xfer_op_t &operation,
                                 const nixl_meta_dlist_t &remote,
                                 nixlBackendReqH *handle) const {
     auto *req_h = static_cast<nixlSpdkKvBackendReqH *>(handle);
-    // Block has no value auto-sizing; leave true_lens empty (getReqTrueLen -> 0).
-    req_h->true_lens.clear();
+    // Block has no value auto-sizing (getReqTrueLen -> 0).
+    req_h->true_len = 0;
+    req_h->true_len_desc = -1;
+
+    // prepXfer validated and stashed every (lba, nlba); consume it here rather
+    // than recomputing computeBlockRange per descriptor (mirrors gusli, which
+    // builds the block IO at prep). A size mismatch means prep did not run for
+    // this handle (or the list changed) -- refuse before any device op.
+    if (req_h->block_ranges.size() != static_cast<size_t>(remote.descCount())) {
+        NIXL_ERROR << "SPDK: block transfer handle is missing its prep-validated LBA ranges";
+        req_h->status = NIXL_ERR_INVALID_PARAM;
+        return NIXL_ERR_INVALID_PARAM;
+    }
 
     for (int i = 0; i < local.descCount(); ++i) {
         const auto &local_desc = local[i];
 
-        // LBA + sector count, with alignment/capacity/single-range validation
-        // (re-checked here so postXfer is self-contained; prepXfer validated too).
-        uint64_t lba = 0;
-        uint32_t nlba = 0;
-        nixl_status_t vs = computeBlockRange(local_desc, remote[i], lba, nlba);
-        if (vs != NIXL_SUCCESS) {
-            req_h->status = vs;
-            return vs;
-        }
+        // The LBA range was validated (alignment/capacity/single-range) in
+        // prepXfer; take it as-is -- no recompute.
+        const uint64_t lba = req_h->block_ranges[i].lba;
+        const uint32_t nlba = req_h->block_ranges[i].nlba;
         if (nlba == 0) {
             // Zero-length descriptor: nothing to transfer.
             continue;
@@ -828,10 +895,10 @@ nixlSpdkKvEngine::getReqTrueLen(nixlBackendReqH *handle, int idx) const {
         return 0;
     }
     const auto *req_h = static_cast<const nixlSpdkKvBackendReqH *>(handle);
-    if (static_cast<size_t>(idx) >= req_h->true_lens.size()) {
-        return 0;
-    }
-    return req_h->true_lens[idx];
+    // A too-small READ records exactly one descriptor's true length. Return it
+    // only for that descriptor; every other index (and the no-mismatch case,
+    // true_len_desc == -1) reports 0, matching the old per-descriptor semantics.
+    return (idx == req_h->true_len_desc) ? req_h->true_len : 0;
 }
 
 uint32_t

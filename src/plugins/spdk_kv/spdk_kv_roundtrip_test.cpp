@@ -885,6 +885,93 @@ main(int argc, char **argv) {
 #endif
     }
 
+    // --- Mid-list partial guard: a 2-descriptor WRITE with ONE bad descriptor
+    // must be rejected at prepXfer and issue ZERO device ops -- neither value is
+    // Stored. This is the regression for the mid-list partial mutation: the old
+    // code validated-and-issued per iteration, so desc0 was durably Stored and
+    // THEN desc1's length mismatch failed the transfer with no rollback (a
+    // partially-applied mutation reported as a failed transfer). prepXfer now
+    // validates the whole list up front, so a bad desc1 rejects before desc0 is
+    // ever Stored. ---
+    {
+        const uint64_t dram_dev = 0, key_dev = 1;
+        const std::string key_good = "nixl-midlist-a00"; // 16 bytes, never stored
+        const std::string key_bad = "nixl-midlist-b00";  // 16 bytes, never stored
+        const size_t good_len = 64;
+
+        std::vector<uint8_t> buf0(good_len), buf1(good_len);
+        for (size_t i = 0; i < good_len; ++i) {
+            buf0[i] = static_cast<uint8_t>(i + 1);
+            buf1[i] = static_cast<uint8_t>(i + 2);
+        }
+
+        nixlBlobDesc s0(reinterpret_cast<uintptr_t>(buf0.data()), good_len, dram_dev, "");
+        nixlBackendMD *s0_md = nullptr;
+        nixlBlobDesc s1(reinterpret_cast<uintptr_t>(buf1.data()), good_len, dram_dev, "");
+        nixlBackendMD *s1_md = nullptr;
+        nixlBlobDesc k0(0, good_len, key_dev, key_good);
+        nixlBackendMD *k0_md = nullptr;
+        // desc1's remote length DIFFERS from its local length -> a malformed
+        // (length-mismatch) descriptor that prepXfer must reject for the whole list.
+        nixlBlobDesc k1(0, good_len * 2, key_dev, key_bad);
+        nixlBackendMD *k1_md = nullptr;
+        if (eng.registerMem(s0, DRAM_SEG, s0_md) != NIXL_SUCCESS ||
+            eng.registerMem(s1, DRAM_SEG, s1_md) != NIXL_SUCCESS ||
+            eng.registerMem(k0, OBJ_SEG, k0_md) != NIXL_SUCCESS ||
+            eng.registerMem(k1, OBJ_SEG, k1_md) != NIXL_SUCCESS) {
+            std::cerr << "FAIL: registerMem (mid-list guard) failed\n";
+            return 1;
+        }
+
+        nixl_meta_dlist_t l(DRAM_SEG);
+        l.addDesc(nixlMetaDesc(reinterpret_cast<uintptr_t>(buf0.data()), good_len, dram_dev, s0_md));
+        l.addDesc(nixlMetaDesc(reinterpret_cast<uintptr_t>(buf1.data()), good_len, dram_dev, s1_md));
+        nixl_meta_dlist_t r(OBJ_SEG);
+        r.addDesc(nixlMetaDesc(0, good_len, key_dev, k0_md));      // desc0: valid
+        r.addDesc(nixlMetaDesc(0, good_len * 2, key_dev, k1_md));  // desc1: len mismatch
+
+        nixlBackendReqH *h = nullptr;
+        nixl_status_t pp = eng.prepXfer(NIXL_WRITE, l, r, init.localAgent, h);
+        if (pp == NIXL_SUCCESS) {
+            // A malformed list must not prepare a transfer. If it did, drive post
+            // so we don't leak the handle, then fail.
+            eng.postXfer(NIXL_WRITE, l, r, init.localAgent, h);
+            eng.releaseReqH(h);
+            eng.deregisterMem(k1_md);
+            eng.deregisterMem(k0_md);
+            eng.deregisterMem(s1_md);
+            eng.deregisterMem(s0_md);
+            std::cerr << "FAIL: mid-list malformed WRITE was accepted at prepXfer "
+                         "(desc1 length mismatch not caught before any device op)\n";
+            return 1;
+        }
+
+        // Prove ZERO device ops: neither key -- crucially the VALID desc0 key --
+        // may have been Stored. A KV Exist on each must report a MISS.
+        nixl_reg_dlist_t q(OBJ_SEG);
+        q.addDesc(nixlBlobDesc(0, 0, key_dev, key_good));
+        q.addDesc(nixlBlobDesc(0, 0, key_dev, key_bad));
+        std::vector<nixl_query_resp_t> resp;
+        nixl_status_t qs = eng.queryMem(q, resp);
+        eng.deregisterMem(k1_md);
+        eng.deregisterMem(k0_md);
+        eng.deregisterMem(s1_md);
+        eng.deregisterMem(s0_md);
+        if (qs != NIXL_SUCCESS || resp.size() != 2) {
+            std::cerr << "FAIL: mid-list guard queryMem failed (status=" << qs
+                      << ", n=" << resp.size() << ")\n";
+            return 1;
+        }
+        if (resp[0].has_value() || resp[1].has_value()) {
+            std::cerr << "FAIL: mid-list partial mutation -- a value was Stored despite "
+                         "prepXfer rejecting the list (desc0 present=" << resp[0].has_value()
+                      << ", desc1 present=" << resp[1].has_value() << ")\n";
+            return 1;
+        }
+        std::cout << "mid-list partial guard OK: a 2-desc WRITE with one bad descriptor "
+                     "is rejected at prepXfer; neither value stored (no partial mutation)\n";
+    }
+
     std::cout << "spdk_kv_roundtrip_test: PASS\n";
     return 0;
 }
