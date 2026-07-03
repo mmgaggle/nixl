@@ -98,12 +98,20 @@ public:
     std::vector<BlockRange> block_ranges;
 };
 
-// Parse "true"/"1"/"yes"/"on" (case-insensitive) as boolean true.
-bool
-parseBool(const std::string &v) {
+// ASCII lower-case a string (locale-independent). Shared by the init-param
+// parsing below so the boolean and namespace-kind sites normalize identically.
+std::string
+toLower(const std::string &v) {
     std::string s;
     s.reserve(v.size());
     for (char c : v) s.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    return s;
+}
+
+// Parse "true"/"1"/"yes"/"on" (case-insensitive) as boolean true.
+bool
+parseBool(const std::string &v) {
+    const std::string s = toLower(v);
     return s == "true" || s == "1" || s == "yes" || s == "on";
 }
 
@@ -170,10 +178,7 @@ nixlSpdkKvEngine::nixlSpdkKvEngine(const nixlBackendInitParams *init_params)
         ns_kind_str.clear();
     }
     if (!ns_kind_str.empty()) {
-        std::string s;
-        s.reserve(ns_kind_str.size());
-        for (char c : ns_kind_str)
-            s.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        const std::string s = toLower(ns_kind_str);
         if (s == "block" || s == "blk" || s == "nvm") {
             ns_kind = SPDK_KV_SHIM_NS_KIND_BLOCK;
         } else if (s == "kv") {

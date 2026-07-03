@@ -168,8 +168,7 @@ descriptor split is built by construction and exercised there, but its
 ## Build
 
 The plugin is gated on the prebuilt SPDK NVMe library and the KV header; it is
-skipped automatically if they are absent. It ships its own shim, so
-`-Dspdk_kv_shim_dir` is **not** used by this plugin.
+skipped automatically if they are absent. It ships its own shim.
 
 ```bash
 meson setup builddir \

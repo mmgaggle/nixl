@@ -48,6 +48,8 @@
 struct spdk_kv_shim {
 	struct spdk_nvme_ctrlr	*ctrlr;
 	struct spdk_nvme_ns	*ns;
+	/* Cached namespace id (spdk_nvme_ns_get_id(ns)); bound once at open. */
+	uint32_t		nsid;
 	struct spdk_nvme_qpair	*qpair;
 	/* Bound namespace kind (option (b): one kind per shim). */
 	bool			is_block;
@@ -272,6 +274,9 @@ spdk_kv_shim_open(const struct spdk_kv_shim_opts *opts, struct spdk_kv_shim **ou
 		rc = -ENOENT;
 		goto err_detach;
 	}
+	/* Cache the namespace id once, bound before any op; kv_xfer_sgl reads it
+	 * per op instead of recomputing spdk_nvme_ns_get_id(sh->ns) each time. */
+	sh->nsid = spdk_nvme_ns_get_id(sh->ns);
 
 	if (sh->is_block) {
 		/*
@@ -800,7 +805,7 @@ kv_xfer_sgl(struct spdk_kv_shim *sh, uint8_t opc, const void *key, uint8_t key_l
 
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.opc = opc;
-	cmd.nsid = spdk_nvme_ns_get_id(sh->ns);
+	cmd.nsid = sh->nsid;
 	/* CDW10: value size (Store) or host buffer size (Retrieve). */
 	cmd.cdw10_bits.kv.vsize = value_len;
 	/* CDW11: inline key length (Request Options 'ro' left 0). */

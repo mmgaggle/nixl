@@ -18,7 +18,7 @@
 # backend that speaks the ratified NVMe Key-Value command set over the SPDK
 # NVMe driver (lib/nvme). WRITE -> KV Store, READ -> KV Retrieve. It ships its
 # OWN generic host shim (spdk_kv_shim.{h,c}); it does NOT depend on any external
-# host shim, so the -Dspdk_kv_shim_dir option is unused here.
+# host shim.
 # ---------------------------------------------------------------------------
 
 # Location of the (already-built) SPDK tree we link against.
