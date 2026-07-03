@@ -200,6 +200,53 @@ void *spdk_kv_shim_dma_alloc_aligned(size_t len, size_t align);
 /** Free a buffer returned by spdk_kv_shim_dma_alloc[_aligned](). Safe with NULL. */
 void spdk_kv_shim_dma_free(void *buf);
 
+/**
+ * Make a caller-owned host region [\c vaddr, \c vaddr + \c len) usable DIRECTLY
+ * as the value buffer for spdk_kv_shim_store/retrieve/read/write -- with NO
+ * staging copy (zero-copy datapath) -- registering it with SPDK if needed. The
+ * region-bounded SGL then walks the caller's buffer in place.
+ *
+ * DMA reachability is TRANSPORT-SPECIFIC, so this takes the shim handle:
+ *   - A vfio-user target maps client memory BY FILE DESCRIPTOR, so only
+ *     fd-backed memory (SPDK-DMA / hugepage / memfd, or a dma-buf) is reachable;
+ *     ordinary anonymous DRAM is NOT, no matter that spdk_mem_register() accepts
+ *     it (spdk_mem_register swallows the failed vfio-user DMA-map notify and
+ *     still returns 0 -- using such a region would silently transfer nothing).
+ *   - A PCIE/IOMMU controller can reach any vtophys-translatable (pinned) DRAM.
+ * This routine registers as needed and then VERIFIES real reachability for the
+ * shim's transport, rolling back a registration that did not take.
+ *
+ * \return  1 if the region was ALREADY DMA-reachable (e.g. caller-provided
+ *            SPDK-DMA memory); it was NOT registered here, so the caller must
+ *            NOT spdk_kv_shim_mem_unregister() it.
+ * \return  0 if the region was newly registered AND verified reachable; the
+ *            caller OWNS the registration and MUST release it with
+ *            spdk_kv_shim_mem_unregister() when done.
+ * \return <0 (negated errno) if the region could not be made reachable
+ *            (-EINVAL: invalid args, or not 4 KiB-aligned; -ENOTSUP: registered
+ *            but the transport cannot reach it, e.g. non-fd-backed DRAM over
+ *            vfio-user -- the registration was rolled back). The caller MUST
+ *            stage-copy through a spdk_kv_shim_dma_alloc() buffer. Registration
+ *            is an optimization, never a correctness requirement.
+ *
+ * Release an OWNED registration with spdk_kv_shim_mem_unregister(); that call is
+ * env-global (takes no shim handle), so the caller passes back the same
+ * (\c vaddr, \c len).
+ */
+int spdk_kv_shim_mem_register(struct spdk_kv_shim *sh, void *vaddr, size_t len);
+
+/**
+ * Release a registration that spdk_kv_shim_mem_register() reported as OWNED
+ * (return 0). Do NOT call for a region it reported as already-reachable
+ * (return 1). The caller MUST ensure no DMA to/from the region is in flight.
+ * Safe with \c vaddr == NULL or \c len == 0 (no-op). \c vaddr / \c len must
+ * match the owned registration. Env-global (no shim handle), matching
+ * spdk_kv_shim_dma_free().
+ *
+ * \return 0 on success, a negated errno on failure.
+ */
+int spdk_kv_shim_mem_unregister(void *vaddr, size_t len);
+
 /** Maximum value length (kvvml) advertised by the bound KV namespace. */
 uint32_t spdk_kv_shim_max_value_len(const struct spdk_kv_shim *sh);
 

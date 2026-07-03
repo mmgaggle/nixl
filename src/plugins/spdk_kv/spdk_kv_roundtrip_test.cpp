@@ -42,6 +42,7 @@
  */
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <optional>
@@ -127,10 +128,89 @@ storeRetrieveVerify(nixlSpdkKvEngine &eng, const std::string &agent,
         ok = (src == dst);
     } while (0);
 
-    // DRAM registrations return a null backend MD; deregisterMem(nullptr) is safe.
     eng.deregisterMem(key_md);
     eng.deregisterMem(dst_md);
     eng.deregisterMem(src_md);
+    return ok;
+}
+
+// Zero-copy variant of storeRetrieveVerify: the source/destination come from
+// SPDK-DMA memory (spdk_kv_shim_dma_alloc -> fd-backed, reachable by the
+// vfio-user target), so registerMem takes the DIRECT datapath -- the device DMAs
+// into the caller's own buffer with NO staging copy. Asserts the engine reports
+// zero-copy for both buffers, then Store+Retrieve `size` bytes byte-exact. Proves
+// the direct-DMA path end-to-end (incl. multi-region large values).
+bool
+storeRetrieveVerifyDirect(nixlSpdkKvEngine &eng, const std::string &agent,
+                          const std::string &key, size_t size) {
+    void *src = spdk_kv_shim_dma_alloc(size);
+    void *dst = spdk_kv_shim_dma_alloc(size);
+    if (src == nullptr || dst == nullptr) {
+        std::cerr << "FAIL: dma_alloc(" << size << ") for zero-copy test\n";
+        spdk_kv_shim_dma_free(src);
+        spdk_kv_shim_dma_free(dst);
+        return false;
+    }
+    auto *src_b = static_cast<uint8_t *>(src);
+    for (size_t i = 0; i < size; ++i) {
+        src_b[i] = static_cast<uint8_t>((i * 2246822519u + 3266489917u) >> 13);
+    }
+    std::memset(dst, 0, size);
+    const uint64_t dram_dev = 0, key_dev = 1;
+
+    nixlBlobDesc src_desc(reinterpret_cast<uintptr_t>(src), size, dram_dev, "");
+    nixlBackendMD *src_md = nullptr;
+    nixlBlobDesc dst_desc(reinterpret_cast<uintptr_t>(dst), size, dram_dev, "");
+    nixlBackendMD *dst_md = nullptr;
+    nixlBlobDesc key_desc(0, size, key_dev, key);
+    nixlBackendMD *key_md = nullptr;
+
+    bool ok = false;
+    do {
+        if (eng.registerMem(src_desc, DRAM_SEG, src_md) != NIXL_SUCCESS ||
+            eng.registerMem(dst_desc, DRAM_SEG, dst_md) != NIXL_SUCCESS ||
+            eng.registerMem(key_desc, OBJ_SEG, key_md) != NIXL_SUCCESS) {
+            std::cerr << "FAIL: registerMem (zero-copy) failed for size " << size << "\n";
+            break;
+        }
+        // The whole point: SPDK-DMA buffers MUST take the zero-copy datapath.
+        if (!eng.dramIsDmaRegistered(src_md) || !eng.dramIsDmaRegistered(dst_md)) {
+            std::cerr << "FAIL: expected zero-copy DMA path for SPDK-DMA buffers (size "
+                      << size << ")\n";
+            break;
+        }
+
+        nixl_meta_dlist_t local(DRAM_SEG);
+        local.addDesc(nixlMetaDesc(reinterpret_cast<uintptr_t>(src), size, dram_dev, src_md));
+        nixl_meta_dlist_t remote(OBJ_SEG);
+        remote.addDesc(nixlMetaDesc(0, size, key_dev, key_md));
+        nixl_meta_dlist_t local_dst(DRAM_SEG);
+        local_dst.addDesc(nixlMetaDesc(reinterpret_cast<uintptr_t>(dst), size, dram_dev, dst_md));
+
+        // WRITE => KV Store (direct DMA from src)
+        nixlBackendReqH *h = nullptr;
+        if (eng.prepXfer(NIXL_WRITE, local, remote, agent, h) != NIXL_SUCCESS) break;
+        nixl_status_t ps = eng.postXfer(NIXL_WRITE, local, remote, agent, h);
+        if (ps != NIXL_SUCCESS && ps != NIXL_IN_PROG) { eng.releaseReqH(h); break; }
+        if (!checkComplete(eng, h)) { eng.releaseReqH(h); break; }
+        eng.releaseReqH(h);
+
+        // READ => KV Retrieve (device DMAs directly into dst)
+        h = nullptr;
+        if (eng.prepXfer(NIXL_READ, local_dst, remote, agent, h) != NIXL_SUCCESS) break;
+        ps = eng.postXfer(NIXL_READ, local_dst, remote, agent, h);
+        if (ps != NIXL_SUCCESS && ps != NIXL_IN_PROG) { eng.releaseReqH(h); break; }
+        if (!checkComplete(eng, h)) { eng.releaseReqH(h); break; }
+        eng.releaseReqH(h);
+
+        ok = (std::memcmp(src, dst, size) == 0);
+    } while (0);
+
+    eng.deregisterMem(key_md);
+    eng.deregisterMem(dst_md);
+    eng.deregisterMem(src_md);
+    spdk_kv_shim_dma_free(src);
+    spdk_kv_shim_dma_free(dst);
     return ok;
 }
 
@@ -550,6 +630,122 @@ main(int argc, char **argv) {
         std::cout << "oversize value (" << (oversize / (1024 * 1024)) << " MiB > "
                   << (SPDK_KV_SHIM_MAX_VALUE_LEN / (1024 * 1024))
                   << " MiB single-op bound) correctly rejected (not split)\n";
+    }
+
+    // --- Zero-copy DMA datapath (direct, no staging copy) ---
+    // SPDK-DMA (fd-backed) buffers must take the DIRECT path: the device DMAs
+    // into the caller's own buffer. Verify byte-exact for a small value and a
+    // multi-region large value (zero-copy across the region-bounded SGL).
+    {
+        const size_t MiB = 1024 * 1024;
+        const struct {
+            const char *key;
+            size_t size;
+        } zc[] = {
+            {"nixl-zerocopy-01", 4096},
+            {"nixl-zerocopy-8m", 8 * MiB}, // 4 x 2 MiB regions, zero-copy large value
+        };
+        for (const auto &c : zc) {
+            if (!storeRetrieveVerifyDirect(eng, init.localAgent, c.key, c.size)) {
+                std::cerr << "FAIL: zero-copy round-trip failed (key '" << c.key
+                          << "', size " << c.size << ")\n";
+                return 1;
+            }
+            std::cout << "zero-copy round-trip OK: " << c.size
+                      << " bytes, device DMA'd into the caller buffer (no staging, key '"
+                      << c.key << "')\n";
+        }
+    }
+
+    // --- Staging fallback: ordinary DRAM must NOT be marked zero-copy ---
+    // A plain 16-byte-aligned heap buffer is neither fd-backed nor 4 KiB-aligned,
+    // so registerMem cannot make it directly reachable and it takes the staged
+    // path. Assert the engine reports it so -- making the zero-copy assertions
+    // above a real discriminator, not vacuously true. (The distinct
+    // register-then-rollback path for a page-aligned anonymous buffer is covered
+    // separately below.)
+    {
+        std::vector<uint8_t> plain(4096, 0);
+        nixlBlobDesc d(reinterpret_cast<uintptr_t>(plain.data()), plain.size(), 0, "");
+        nixlBackendMD *md = nullptr;
+        if (eng.registerMem(d, DRAM_SEG, md) != NIXL_SUCCESS) {
+            std::cerr << "FAIL: registerMem(plain DRAM) failed\n";
+            return 1;
+        }
+        const bool direct = eng.dramIsDmaRegistered(md);
+        eng.deregisterMem(md);
+        if (direct) {
+            std::cerr << "FAIL: ordinary heap DRAM unexpectedly took the zero-copy path "
+                         "(expected staging fallback over vfio-user)\n";
+            return 1;
+        }
+        std::cout << "staging fallback confirmed: ordinary DRAM is not fd-backed, "
+                     "stages over vfio-user\n";
+    }
+
+    // --- Register-then-rollback path + no corruption (the anti-silent-failure) ---
+    // A PAGE-ALIGNED anonymous buffer passes the 4 KiB pre-check, so
+    // registerMem calls spdk_mem_register() (which succeeds, yet its vfio-user
+    // DMA-map notify silently fails because anonymous memory is not fd-backed).
+    // The engine must detect the region is still not reachable, ROLL BACK the
+    // registration, and stage -- NOT mark it zero-copy (which would transfer to
+    // memory the target cannot see). Assert not-direct AND that a full round-trip
+    // through this buffer is byte-exact (proving the rollback left no corruption).
+    {
+        const size_t sz = 8192; // page-aligned length
+        void *buf = nullptr;
+        if (posix_memalign(&buf, 4096, sz) != 0 || buf == nullptr) {
+            std::cerr << "FAIL: posix_memalign for rollback test\n";
+            return 1;
+        }
+        auto *bb = static_cast<uint8_t *>(buf);
+        for (size_t i = 0; i < sz; ++i) bb[i] = static_cast<uint8_t>(i * 31u + 7u);
+        std::vector<uint8_t> expect(bb, bb + sz);
+        const uint64_t dram_dev = 0, key_dev = 1;
+        const std::string key = "nixl-rollback-01"; // 16 bytes
+
+        nixlBlobDesc src_desc(reinterpret_cast<uintptr_t>(buf), sz, dram_dev, "");
+        nixlBackendMD *src_md = nullptr;
+        nixlBlobDesc key_desc(0, sz, key_dev, key);
+        nixlBackendMD *key_md = nullptr;
+        int rc = 1;
+        if (eng.registerMem(src_desc, DRAM_SEG, src_md) != NIXL_SUCCESS ||
+            eng.registerMem(key_desc, OBJ_SEG, key_md) != NIXL_SUCCESS) {
+            std::cerr << "FAIL: registerMem (rollback case) failed\n";
+        } else if (eng.dramIsDmaRegistered(src_md)) {
+            std::cerr << "FAIL: page-aligned anonymous DRAM was marked zero-copy over "
+                         "vfio-user (spdk_mem_register's swallowed DMA-map failure not "
+                         "caught -> would silently transfer nothing)\n";
+        } else {
+            nixl_meta_dlist_t local(DRAM_SEG);
+            local.addDesc(nixlMetaDesc(reinterpret_cast<uintptr_t>(buf), sz, dram_dev, src_md));
+            nixl_meta_dlist_t remote(OBJ_SEG);
+            remote.addDesc(nixlMetaDesc(0, sz, key_dev, key_md));
+            nixlBackendReqH *h = nullptr;
+            bool round_ok = false;
+            if (eng.prepXfer(NIXL_WRITE, local, remote, init.localAgent, h) == NIXL_SUCCESS) {
+                eng.postXfer(NIXL_WRITE, local, remote, init.localAgent, h);
+                round_ok = checkComplete(eng, h);
+            }
+            eng.releaseReqH(h);
+            std::memset(buf, 0, sz);
+            h = nullptr;
+            if (round_ok && eng.prepXfer(NIXL_READ, local, remote, init.localAgent, h) == NIXL_SUCCESS) {
+                eng.postXfer(NIXL_READ, local, remote, init.localAgent, h);
+                round_ok = checkComplete(eng, h);
+            }
+            eng.releaseReqH(h);
+            rc = (round_ok && std::memcmp(buf, expect.data(), sz) == 0) ? 0 : 2;
+        }
+        eng.deregisterMem(key_md);
+        eng.deregisterMem(src_md);
+        free(buf);
+        if (rc != 0) {
+            std::cerr << "FAIL: register-then-rollback staged round-trip (rc=" << rc << ")\n";
+            return 1;
+        }
+        std::cout << "register-then-rollback OK: page-aligned anonymous DRAM staged "
+                     "safely over vfio-user, byte-exact (no silent no-op)\n";
     }
 
     std::cout << "spdk_kv_roundtrip_test: PASS\n";

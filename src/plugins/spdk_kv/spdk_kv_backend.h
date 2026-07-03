@@ -87,16 +87,25 @@ struct spdk_kv_shim;
  * datapath transport-agnostic. For ergonomics a bare socket dir may be passed
  * as "vfu_addr"/"socket" and is wrapped into a VFIOUSER transport ID.
  *
- * Staging / zero-copy approach (DOCUMENTED):
- *   SPDK Store/Retrieve require the value buffer to be SPDK-DMA memory. User
- *   DRAM registered through registerMem() is ordinary host memory and is
- *   generally NOT DMA-capable, so this skeleton STAGES through a per-request
- *   shim DMA buffer and copies:
- *     - WRITE: memcpy(user DRAM -> DMA buf) then Store(key, DMA buf)
- *     - READ : Retrieve(key, DMA buf) then memcpy(DMA buf -> user DRAM)
- *   The staging DMA buffer is described to the device by a region-bounded SGL
- *   (see spdk_kv_shim), so this holds for large values too. A future revision
- *   (VRAM/P2PDMA) registers the user/GPU buffer directly and skips the copy.
+ * Zero-copy datapath, with a staging fallback (DOCUMENTED):
+ *   Store/Retrieve/read/write DMA to/from the value buffer, so it must be
+ *   DMA-reachable by the shim's transport. registerMem() asks the shim to make
+ *   the caller's DRAM reachable (spdk_kv_shim_mem_register); when it is, postXfer
+ *   hands the caller's buffer straight to the shim -- NO copy:
+ *     - WRITE: Store/write(key/lba, user DRAM)
+ *     - READ : Retrieve/read(key/lba, user DRAM)   (device DMAs into user DRAM)
+ *   Reachability is TRANSPORT-SPECIFIC: a vfio-user target maps client memory by
+ *   fd, so only fd-backed memory (SPDK-DMA / hugepage / memfd, or a dma-buf) is
+ *   directly usable there -- ordinary anonymous DRAM is not, and takes the
+ *   fallback; a PCIE/IOMMU controller can reach any 4 KiB-aligned,
+ *   vtophys-translatable DRAM (registerMem registers it, IOMMU-mapping + pinning
+ *   it). For an unreachable region the engine
+ *   FALLS BACK to staging through a per-request shim DMA buffer and copies
+ *   (memcpy user<->DMA around the op). Both the direct and staged buffers are
+ *   described to the device by the SAME region-bounded SGL (see spdk_kv_shim),
+ *   so large values work either way. The fallback is always correct -- just a
+ *   copy; dramIsDmaRegistered() reports which path a region took. Registering a
+ *   GPU/VRAM dma-buf directly (P2PDMA) is a later extension of this same hook.
  */
 class nixlSpdkKvEngine : public nixlBackendEngine {
 public:
@@ -184,7 +193,11 @@ public:
     // device's TRUE value length (completion cdw0) recorded for descriptor
     // \c idx, so the caller can resize its buffer/descriptor and re-Retrieve.
     // Returns 0 when the handle recorded no true length for \c idx (e.g. the
-    // READ fit, or \c idx is out of range).
+    // READ fit, or \c idx is out of range). On NIXL_ERR_MISMATCH the destination
+    // buffer's contents are UNSPECIFIED and must not be used -- the staged path
+    // leaves them unchanged while the zero-copy path may have DMA'd a partial
+    // (truncated, unusable) value into them; either way the caller resizes and
+    // re-Retrieves, which overwrites the buffer.
     size_t
     getReqTrueLen(nixlBackendReqH *handle, int idx = 0) const;
 
@@ -195,6 +208,16 @@ public:
     // datapath or any transfer state.
     uint32_t
     blockSectorSize() const;
+
+    // Introspection: true when the local DRAM region behind \c md was
+    // DMA-registered in registerMem, so its transfers take the zero-copy
+    // datapath (the shim DMAs directly into the caller's buffer). False when the
+    // region is staged through a bounce buffer (it was unaligned or SPDK refused
+    // the registration) or \c md is not a DRAM registration. Lets a caller or
+    // operator confirm whether a given host buffer actually got zero-copy; does
+    // not touch the datapath or any transfer state.
+    bool
+    dramIsDmaRegistered(const nixlBackendMD *md) const;
 
 private:
     // Ratified maximum NVMe-KV inline key length (bytes).

@@ -90,9 +90,24 @@ failure returns an error status (never masked as a miss).
   may be passed as `vfu_addr`/`socket` and is wrapped into a VFIOUSER trid.
 - **Key is opaque.** Lineage-vs-flat is the caller's key-format choice; the
   generic plugin only checks the bytes fit the ratified 1–16-byte window.
-- **DRAM staging.** SPDK Store/Retrieve need DMA-capable buffers; registered
-  user DRAM generally is not, so the plugin stages through a per-request SPDK
-  DMA buffer and copies. A future revision registers user/GPU buffers directly.
+- **Zero-copy DRAM, with a staging fallback.** Store/Retrieve/read/write DMA
+  to/from the value buffer, so it must be DMA-reachable by the transport.
+  `registerMem()` makes the caller's DRAM reachable (`spdk_kv_shim_mem_register`)
+  and the datapath then DMAs **straight into the caller's buffer — no copy**
+  (Store/write from it, Retrieve/read into it). **Reachability is
+  transport-specific:** a **vfio-user** target maps client memory *by fd*, so
+  only fd-backed memory (SPDK-DMA / hugepage / memfd, or a dma-buf) is directly
+  usable there — plain anonymous DRAM is not (a subtlety: `spdk_mem_register()`
+  accepts it yet silently fails to map it to the target, so the plugin verifies
+  real reachability and rolls back a registration that did not take); a
+  **PCIE/IOMMU** controller can reach any 4 KiB-aligned, vtophys-translatable
+  DRAM, which the plugin registers (IOMMU-mapping and pinning it). For an
+  unreachable region the plugin **falls
+  back** to staging through a per-request SPDK DMA buffer and copying — always
+  correct, just a copy. Both paths describe the buffer to the device with the
+  same region-bounded SGL, so large values are zero-copy too.
+  `nixlSpdkKvEngine::dramIsDmaRegistered()` reports which path a region took.
+  Registering a GPU/VRAM dma-buf directly (P2PDMA) extends this same hook.
 - **Value auto-sizing.** On Retrieve the completion `cdw0` carries the device's
   TRUE stored length. Devices signal a short host buffer two ways — SUCCESS with
   `cdw0 > buf_len` (this KV target), or `0x85 INVALID_VALUE_SIZE` directly — and

@@ -159,6 +159,81 @@ writeReadVerify(nixlSpdkKvEngine &eng, const std::string &agent, uint64_t lba, s
     return ok;
 }
 
+// Zero-copy variant of writeReadVerify: source/destination come from SPDK-DMA
+// memory (spdk_kv_shim_dma_alloc -> fd-backed, reachable by the vfio-user
+// target), so registerMem takes the DIRECT block datapath -- the device DMAs
+// straight to/from the caller's own buffer, no staging copy. Asserts the engine
+// reports zero-copy, then write+read `size` bytes at `lba` byte-exact.
+bool
+writeReadVerifyDirect(nixlSpdkKvEngine &eng, const std::string &agent, uint64_t lba, size_t size) {
+    void *src = spdk_kv_shim_dma_alloc(size);
+    void *dst = spdk_kv_shim_dma_alloc(size);
+    if (src == nullptr || dst == nullptr) {
+        std::cerr << "FAIL: dma_alloc(" << size << ") for zero-copy block test\n";
+        spdk_kv_shim_dma_free(src);
+        spdk_kv_shim_dma_free(dst);
+        return false;
+    }
+    auto *src_b = static_cast<uint8_t *>(src);
+    for (size_t i = 0; i < size; ++i) {
+        src_b[i] = static_cast<uint8_t>((i * 2654435761u + static_cast<uint32_t>(lba) * 40503u) >> 13);
+    }
+    std::memset(dst, 0, size);
+    const uint64_t dram_dev = 0, blk_dev = 1;
+
+    nixlBlobDesc src_desc(reinterpret_cast<uintptr_t>(src), size, dram_dev, "");
+    nixlBackendMD *src_md = nullptr;
+    nixlBlobDesc dst_desc(reinterpret_cast<uintptr_t>(dst), size, dram_dev, "");
+    nixlBackendMD *dst_md = nullptr;
+    nixlBlobDesc blk_desc(lba, size, blk_dev, ""); // addr == LBA, no key
+    nixlBackendMD *blk_md = nullptr;
+
+    bool ok = false;
+    do {
+        if (eng.registerMem(src_desc, DRAM_SEG, src_md) != NIXL_SUCCESS ||
+            eng.registerMem(dst_desc, DRAM_SEG, dst_md) != NIXL_SUCCESS ||
+            eng.registerMem(blk_desc, BLK_SEG, blk_md) != NIXL_SUCCESS) {
+            std::cerr << "FAIL: registerMem (zero-copy block) failed for size " << size << "\n";
+            break;
+        }
+        if (!eng.dramIsDmaRegistered(src_md) || !eng.dramIsDmaRegistered(dst_md)) {
+            std::cerr << "FAIL: expected zero-copy DMA path for SPDK-DMA block buffers (size "
+                      << size << ")\n";
+            break;
+        }
+
+        nixl_meta_dlist_t local(DRAM_SEG);
+        local.addDesc(nixlMetaDesc(reinterpret_cast<uintptr_t>(src), size, dram_dev, src_md));
+        nixl_meta_dlist_t remote(BLK_SEG);
+        remote.addDesc(nixlMetaDesc(lba, size, blk_dev, blk_md));
+        nixl_meta_dlist_t local_dst(DRAM_SEG);
+        local_dst.addDesc(nixlMetaDesc(reinterpret_cast<uintptr_t>(dst), size, dram_dev, dst_md));
+
+        nixlBackendReqH *h = nullptr;
+        if (eng.prepXfer(NIXL_WRITE, local, remote, agent, h) != NIXL_SUCCESS) break;
+        nixl_status_t ps = eng.postXfer(NIXL_WRITE, local, remote, agent, h);
+        if (ps != NIXL_SUCCESS && ps != NIXL_IN_PROG) { eng.releaseReqH(h); break; }
+        if (!checkComplete(eng, h)) { eng.releaseReqH(h); break; }
+        eng.releaseReqH(h);
+
+        h = nullptr;
+        if (eng.prepXfer(NIXL_READ, local_dst, remote, agent, h) != NIXL_SUCCESS) break;
+        ps = eng.postXfer(NIXL_READ, local_dst, remote, agent, h);
+        if (ps != NIXL_SUCCESS && ps != NIXL_IN_PROG) { eng.releaseReqH(h); break; }
+        if (!checkComplete(eng, h)) { eng.releaseReqH(h); break; }
+        eng.releaseReqH(h);
+
+        ok = (std::memcmp(src, dst, size) == 0);
+    } while (0);
+
+    eng.deregisterMem(blk_md);
+    eng.deregisterMem(dst_md);
+    eng.deregisterMem(src_md);
+    spdk_kv_shim_dma_free(src);
+    spdk_kv_shim_dma_free(dst);
+    return ok;
+}
+
 // Attempt a WRITE of `size` bytes at `lba` and assert the engine REJECTS it with
 // the SPECIFIC status `expected` -- not merely "some non-success". Checks that
 // the FIRST non-success across prep -> post -> check equals `expected` exactly,
@@ -323,6 +398,30 @@ main(int argc, char **argv) {
             return 1;
         }
         std::cout << "block round-trip OK: " << sz << " bytes at LBA " << lba << "\n";
+    }
+
+    // --- Zero-copy block datapath (direct, no staging copy) ---
+    // SPDK-DMA (fd-backed) buffers must take the DIRECT path: the device DMAs
+    // straight to/from the caller's buffer. Verify a single-region and a
+    // multi-region (zero-copy over the region-bounded SGL) transfer byte-exact.
+    {
+        const size_t MiB = 1024 * 1024;
+        const struct {
+            uint64_t lba;
+            size_t size;
+        } zc[] = {
+            {0, 4096},
+            {0, 8 * MiB}, // 4 x 2 MiB regions, zero-copy large block transfer
+        };
+        for (const auto &c : zc) {
+            if (!writeReadVerifyDirect(eng, init.localAgent, c.lba, c.size)) {
+                std::cerr << "FAIL: zero-copy block round-trip failed (" << c.size
+                          << " bytes at LBA " << c.lba << ")\n";
+                return 1;
+            }
+            std::cout << "zero-copy block round-trip OK: " << c.size
+                      << " bytes at LBA " << c.lba << " (device DMA'd caller buffer, no staging)\n";
+        }
     }
 
     // --- Distinct-LBA addressing: write DIFFERENT patterns to two DISJOINT LBA

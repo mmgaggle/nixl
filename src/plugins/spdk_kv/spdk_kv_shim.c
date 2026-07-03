@@ -371,6 +371,83 @@ spdk_kv_shim_dma_free(void *buf)
 	spdk_dma_free(buf);
 }
 
+/*
+ * Is [vaddr, vaddr+len) DMA-reachable by this shim's transport RIGHT NOW? The
+ * check is transport-specific:
+ *   - vfio-user: the target maps client memory by fd, so the region must be
+ *     fd-backed (spdk_mem_get_fd_and_offset() returns an fd). Anonymous DRAM is
+ *     not reachable even after spdk_mem_register() (its DMA-map notify fails).
+ *   - PCIE / IOMMU (or unknown): reachable iff spdk_vtophys() can translate it,
+ *     which spdk_mem_register() arranges by pinning + IOMMU-mapping the pages.
+ * Probes the base address; SPDK-DMA and freshly-registered regions are
+ * contiguous, and a mid-transfer translation gap fails the op cleanly (lib/nvme
+ * bad-vtophys) rather than corrupting data.
+ */
+static bool
+kv_mem_reachable(const struct spdk_kv_shim *sh, const void *vaddr, size_t len)
+{
+	const struct spdk_nvme_transport_id *trid;
+
+	if (sh == NULL || sh->ctrlr == NULL || vaddr == NULL || len == 0) {
+		return false;
+	}
+	trid = spdk_nvme_ctrlr_get_transport_id(sh->ctrlr);
+	if (trid != NULL && trid->trtype == SPDK_NVME_TRANSPORT_VFIOUSER) {
+		uint64_t off = 0;
+		return spdk_mem_get_fd_and_offset((void *)(uintptr_t)vaddr, &off) >= 0;
+	}
+	uint64_t sz = len;
+	return spdk_vtophys(vaddr, &sz) != SPDK_VTOPHYS_ERROR;
+}
+
+int
+spdk_kv_shim_mem_register(struct spdk_kv_shim *sh, void *vaddr, size_t len)
+{
+	int rc;
+
+	if (sh == NULL || vaddr == NULL || len == 0) {
+		return -EINVAL;
+	}
+	/*
+	 * Already reachable (e.g. the caller handed us SPDK-DMA / hugepage memory):
+	 * use it directly and do NOT register it, so we never unregister memory we
+	 * do not own.
+	 */
+	if (kv_mem_reachable(sh, vaddr, len)) {
+		return 1;
+	}
+	/* spdk_mem_register() requires 4 KiB alignment of base and length. */
+	if (((uintptr_t)vaddr & (4096u - 1)) != 0 || (len & (4096u - 1)) != 0) {
+		return -EINVAL;
+	}
+	rc = spdk_mem_register(vaddr, len);
+	if (rc != 0) {
+		return rc;
+	}
+	/*
+	 * CRUCIAL: spdk_mem_register() fires each memory map's DMA-map notify but
+	 * SWALLOWS a notify failure and still returns 0. Over vfio-user, mapping
+	 * non-fd-backed DRAM to the target fails there -- the region would look
+	 * registered yet be invisible to the target (a silent no-op transfer).
+	 * Verify real reachability now; if it did not take, roll back and tell the
+	 * caller to stage-copy.
+	 */
+	if (!kv_mem_reachable(sh, vaddr, len)) {
+		spdk_mem_unregister(vaddr, len);
+		return -ENOTSUP;
+	}
+	return 0;
+}
+
+int
+spdk_kv_shim_mem_unregister(void *vaddr, size_t len)
+{
+	if (vaddr == NULL || len == 0) {
+		return 0;
+	}
+	return spdk_mem_unregister(vaddr, len);
+}
+
 uint32_t
 spdk_kv_shim_sector_size(const struct spdk_kv_shim *sh)
 {
