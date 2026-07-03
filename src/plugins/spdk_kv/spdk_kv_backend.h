@@ -254,6 +254,10 @@ private:
     uint8_t maxKeyLen_ = kMaxKeyLen;
 
     // True when the shim bound a CSI==NVM block namespace (csi=block init param).
+    // Drives the op-set: getSupportedMems() derives {DRAM_SEG, BLK_SEG} vs
+    // {DRAM_SEG, OBJ_SEG} from it, and registerMem/postXfer/queryMem reject a
+    // cross-mode remote (OBJ_SEG in block mode, BLK_SEG in KV mode) so a KV op is
+    // never routed to a block namespace (the KV opcodes alias NVM WRITE/READ).
     bool blockMode_ = false;
 };
 

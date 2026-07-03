@@ -748,6 +748,48 @@ main(int argc, char **argv) {
                      "safely over vfio-user, byte-exact (no silent no-op)\n";
     }
 
+    // --- Cross-mode guard: BLK_SEG is refused on a KV-bound engine ---
+    // Symmetric to the block test's OBJ_SEG-on-block guard: a KV-bound engine
+    // has no LBA space, so it must not advertise or accept BLK_SEG. Refusing here
+    // (before any device op) keeps the op-set matched to the bound namespace kind.
+    {
+        // getSupportedMems() must advertise the KV op-set only (no BLK_SEG).
+        const nixl_mem_list_t mems = eng.getSupportedMems();
+        bool has_obj = false, has_blk = false, has_dram = false;
+        for (nixl_mem_t m : mems) {
+            if (m == OBJ_SEG) has_obj = true;
+            if (m == BLK_SEG) has_blk = true;
+            if (m == DRAM_SEG) has_dram = true;
+        }
+        if (has_blk || !has_obj || !has_dram) {
+            std::cerr << "FAIL: KV-mode getSupportedMems must be {DRAM_SEG, OBJ_SEG} "
+                         "(no BLK_SEG)\n";
+            return 1;
+        }
+
+        // registerMem(BLK_SEG) must be refused on a KV engine.
+        nixlBlobDesc blk_desc(/*lba=*/0, 4096, /*devId=*/1, "");
+        nixlBackendMD *blk_md = nullptr;
+        if (eng.registerMem(blk_desc, BLK_SEG, blk_md) != NIXL_ERR_NOT_SUPPORTED) {
+            std::cerr << "FAIL: registerMem(BLK_SEG) on a KV engine was not refused "
+                         "with NIXL_ERR_NOT_SUPPORTED\n";
+            eng.deregisterMem(blk_md);
+            return 1;
+        }
+
+        // queryMem(BLK_SEG) has no per-LBA existence notion and must be refused.
+        nixl_reg_dlist_t q(BLK_SEG);
+        q.addDesc(nixlBlobDesc(0, 4096, /*devId=*/1, ""));
+        std::vector<nixl_query_resp_t> resp;
+        if (eng.queryMem(q, resp) != NIXL_ERR_NOT_SUPPORTED) {
+            std::cerr << "FAIL: queryMem(BLK_SEG) on a KV engine was not refused "
+                         "with NIXL_ERR_NOT_SUPPORTED\n";
+            return 1;
+        }
+        std::cout << "cross-mode guard OK: KV-mode engine refuses BLK_SEG at "
+                     "getSupportedMems/registerMem/queryMem\n";
+    }
+
     std::cout << "spdk_kv_roundtrip_test: PASS\n";
     return 0;
 }

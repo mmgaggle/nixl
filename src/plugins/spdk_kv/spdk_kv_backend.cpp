@@ -233,10 +233,18 @@ nixlSpdkKvEngine::~nixlSpdkKvEngine() {
 
 nixl_mem_list_t
 nixlSpdkKvEngine::getSupportedMems() const {
-    // Local host DRAM source; remote is either an OBJ-style key-addressed KV
-    // blob (OBJ_SEG) or an NVMe block LBA range (BLK_SEG). The op-set is chosen
-    // per transfer by the remote memory type.
-    return {DRAM_SEG, OBJ_SEG, BLK_SEG};
+    // The remote op-set is fixed by the bound namespace kind (option (b)): a
+    // KV-bound engine exposes the key-addressed KV blob (OBJ_SEG), a block-bound
+    // engine exposes the NVMe LBA range (BLK_SEG). Deriving the list from the
+    // mode keeps advertisement and enforcement in lockstep: advertising both
+    // regardless of mode would let a caller register (and transfer) a cross-mode
+    // remote, which -- because the KV opcodes alias NVM WRITE/READ -- would run a
+    // KV op as a wild-LBA block op. Local host DRAM (DRAM_SEG) is the
+    // source/sink in either mode.
+    if (blockMode_) {
+        return {DRAM_SEG, BLK_SEG};
+    }
+    return {DRAM_SEG, OBJ_SEG};
 }
 
 nixl_status_t
@@ -245,6 +253,18 @@ nixlSpdkKvEngine::registerMem(const nixlBlobDesc &mem,
                               nixlBackendMD *&out) {
     if (nixl_mem != DRAM_SEG && nixl_mem != OBJ_SEG && nixl_mem != BLK_SEG)
         return NIXL_ERR_NOT_SUPPORTED;
+
+    // Cross-mode guard: the remote op-set must match the bound namespace kind. A
+    // block-bound engine must refuse OBJ_SEG (KV) and a KV-bound engine must
+    // refuse BLK_SEG, before any per-descriptor metadata is built -- otherwise a
+    // KV op could later be routed to a block namespace (the KV opcodes alias NVM
+    // WRITE/READ -> wild-LBA corruption). DRAM_SEG (the local buffer) is valid in
+    // either mode.
+    if ((nixl_mem == OBJ_SEG && blockMode_) || (nixl_mem == BLK_SEG && !blockMode_)) {
+        NIXL_ERROR << "SPDK: memory type " << nixl_mem
+                   << " does not match the engine's namespace kind; rejecting";
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
 
     if (nixl_mem == OBJ_SEG) {
         // The remote descriptor carries the NIXL block identifier in metaInfo.
@@ -380,9 +400,21 @@ nixlSpdkKvEngine::postXfer(const nixl_xfer_op_t &operation,
         NIXL_ERROR << "SPDK_KV: shim not initialized";
         return NIXL_ERR_BACKEND;
     }
+    // Cross-mode guard: the remote op-set must match the bound namespace kind,
+    // enforced before any device op. A KV (OBJ_SEG) transfer on a block-bound
+    // engine would alias a KV Store to an NVM WRITE at a wild LBA (silent
+    // corruption); a block (BLK_SEG) transfer on a KV-bound engine is equally
+    // invalid. Mirrors the shim's is_block guards and registerMem.
+    const nixl_mem_t remote_type = remote.getType();
+    if ((remote_type == OBJ_SEG && blockMode_) || (remote_type == BLK_SEG && !blockMode_)) {
+        NIXL_ERROR << "SPDK: remote memory type " << remote_type
+                   << " does not match the engine's namespace kind; rejecting";
+        static_cast<nixlSpdkKvBackendReqH *>(handle)->status = NIXL_ERR_NOT_SUPPORTED;
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
     // LBA/KV knob: a BLK_SEG remote drives the NVMe block path; OBJ_SEG falls
     // through to the unchanged KV (Store/Retrieve) path below.
-    if (remote.getType() == BLK_SEG) {
+    if (remote_type == BLK_SEG) {
         return postXferBlock(operation, local, remote, handle);
     }
     auto *req_h = static_cast<nixlSpdkKvBackendReqH *>(handle);
@@ -445,10 +477,11 @@ nixlSpdkKvEngine::postXfer(const nixl_xfer_op_t &operation,
         // the caller's buffer straight to the shim (no alloc, no memcpy). When it
         // was not (unaligned / unregisterable), stage through an SPDK-DMA buffer
         // and copy -- always correct, just a copy. The region-bounded SGL walks
-        // whichever buffer we pass. dynamic_cast so an unexpected MD type simply
-        // yields nullptr and takes the (safe) staged path rather than misreading
-        // the direct-path flag.
-        auto *dram = dynamic_cast<nixlSpdkKvDramMD *>(local_desc.metadataP);
+        // whichever buffer we pass. prepXfer guarantees the local seg is DRAM_SEG
+        // and registerMem always builds a nixlSpdkKvDramMD for DRAM_SEG, so the
+        // local MD type is statically known -- static_cast. The nullptr guard
+        // still covers a descriptor registered with no MD (staged path).
+        auto *dram = static_cast<nixlSpdkKvDramMD *>(local_desc.metadataP);
         const bool direct = dram != nullptr && dram->dma_registered;
         void *io_buf = data_ptr;
         if (!direct) {
@@ -626,9 +659,11 @@ nixlSpdkKvEngine::postXferBlock(const nixl_xfer_op_t &operation,
         // 4 KiB-aligned) buffer at each 2 MiB boundary, so neither path lets a
         // descriptor straddle two independently-mapped vfio-user regions (up to
         // the ~64 MiB single-op bound). NO value auto-sizing (block moves exactly
-        // len bytes). dynamic_cast so an unexpected MD type takes the safe staged
-        // path (nullptr) rather than misreading the direct-path flag.
-        auto *dram = dynamic_cast<nixlSpdkKvDramMD *>(local_desc.metadataP);
+        // len bytes). prepXfer guarantees the local seg is DRAM_SEG and
+        // registerMem always builds a nixlSpdkKvDramMD for DRAM_SEG, so the local
+        // MD type is statically known -- static_cast. The nullptr guard still
+        // covers a descriptor registered with no MD (staged path).
+        auto *dram = static_cast<nixlSpdkKvDramMD *>(local_desc.metadataP);
         const bool direct = dram != nullptr && dram->dma_registered;
         void *io_buf = data_ptr;
         if (!direct) {
@@ -704,6 +739,14 @@ nixlSpdkKvEngine::queryMem(const nixl_reg_dlist_t &descs,
     if (descs.getType() != OBJ_SEG) {
         NIXL_ERROR << "SPDK: queryMem is only supported for OBJ_SEG (KV Exist), got "
                    << descs.getType();
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+    // Cross-mode guard: KV Exist requires a KV-bound engine. A block-bound
+    // engine has no key space, so refuse OBJ_SEG here (before any device op)
+    // rather than issuing a KV Exist against a block namespace.
+    if (blockMode_) {
+        NIXL_ERROR << "SPDK: queryMem (KV Exist) requires a KV namespace; this "
+                      "engine is block-bound";
         return NIXL_ERR_NOT_SUPPORTED;
     }
     if (!shim_) {

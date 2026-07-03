@@ -577,6 +577,17 @@ kv_xfer_sgl(struct spdk_kv_shim *sh, uint8_t opc, const void *key, uint8_t key_l
 	if (sh == NULL || key == NULL || value == NULL || value_len == 0) {
 		return -EINVAL;
 	}
+	/*
+	 * Mode guard (mirrors blk_rw's !is_block reject): the KV op-set must never
+	 * run on a block-bound shim. SPDK_NVME_OPC_KV_STORE (0x01) and
+	 * SPDK_NVME_OPC_KV_RETRIEVE (0x02) alias the NVM WRITE/READ opcodes, so a KV
+	 * Store submitted to a block namespace would be executed as an NVM WRITE at
+	 * an SLBA decoded from the KV cdw10/11 key fields -- a silent write to a wild
+	 * LBA. Refuse before building the command.
+	 */
+	if (sh->is_block) {
+		return -EINVAL;
+	}
 	if (key_len < SPDK_NVME_KV_KEY_MIN_LEN || key_len > SPDK_NVME_KV_KEY_MAX_LEN) {
 		return -EINVAL;
 	}
@@ -688,6 +699,13 @@ spdk_kv_shim_exist(struct spdk_kv_shim *sh, const void *key, uint8_t key_len)
 	int rc;
 
 	if (sh == NULL) {
+		return -EINVAL;
+	}
+	/*
+	 * Mode guard: KV Exist is invalid on a block-bound shim (mirrors blk_rw and
+	 * kv_xfer_sgl). Refuse before submitting any command.
+	 */
+	if (sh->is_block) {
 		return -EINVAL;
 	}
 	sh->op_done = false;

@@ -599,6 +599,83 @@ main(int argc, char **argv) {
         std::cout << "queryMem(BLK_SEG) correctly reports NOT_SUPPORTED\n";
     }
 
+    // --- Cross-mode guard: OBJ_SEG (KV) is refused on a block-bound engine ---
+    // This engine's namespace is CSI==NVM. Because the KV opcodes alias the NVM
+    // WRITE/READ opcodes (KV_STORE == WRITE, KV_RETRIEVE == READ), accepting a KV
+    // (OBJ_SEG) transfer here would execute a KV Store as an NVM WRITE at an SLBA
+    // decoded from the KV key fields -- a silent write to a wild LBA. Assert
+    // every entry point refuses OBJ_SEG cleanly, before any device op.
+    {
+        // getSupportedMems() must advertise the block op-set only (no OBJ_SEG).
+        const nixl_mem_list_t mems = eng.getSupportedMems();
+        bool has_obj = false, has_blk = false, has_dram = false;
+        for (nixl_mem_t m : mems) {
+            if (m == OBJ_SEG) has_obj = true;
+            if (m == BLK_SEG) has_blk = true;
+            if (m == DRAM_SEG) has_dram = true;
+        }
+        if (has_obj || !has_blk || !has_dram) {
+            std::cerr << "FAIL: block-mode getSupportedMems must be {DRAM_SEG, BLK_SEG} "
+                         "(no OBJ_SEG)\n";
+            return 1;
+        }
+
+        // registerMem(OBJ_SEG) must be refused before building any KV-key metadata.
+        nixlBlobDesc obj_desc(0, 4096, /*devId=*/1, "nixl-crossmode01");
+        nixlBackendMD *obj_md = nullptr;
+        if (eng.registerMem(obj_desc, OBJ_SEG, obj_md) != NIXL_ERR_NOT_SUPPORTED) {
+            std::cerr << "FAIL: registerMem(OBJ_SEG) on a block engine was not refused "
+                         "with NIXL_ERR_NOT_SUPPORTED\n";
+            eng.deregisterMem(obj_md);
+            return 1;
+        }
+
+        // queryMem(OBJ_SEG) (KV Exist) must be refused before any device op.
+        nixl_reg_dlist_t q(OBJ_SEG);
+        q.addDesc(nixlBlobDesc(0, 0, /*devId=*/1, "nixl-crossmode01"));
+        std::vector<nixl_query_resp_t> resp;
+        if (eng.queryMem(q, resp) != NIXL_ERR_NOT_SUPPORTED) {
+            std::cerr << "FAIL: queryMem(OBJ_SEG) on a block engine was not refused "
+                         "with NIXL_ERR_NOT_SUPPORTED\n";
+            return 1;
+        }
+
+        // postXfer of an OBJ_SEG remote must be refused BEFORE any device op. The
+        // remote carries a nullptr KV-key metadata, so had the mode guard NOT
+        // fired first the KV path would instead fail with INVALID_PARAM (missing
+        // metadata); asserting exactly NIXL_ERR_NOT_SUPPORTED proves the guard
+        // refused it up front, before touching the device.
+        std::vector<uint8_t> buf(4096, 0);
+        nixlBlobDesc dram_desc(reinterpret_cast<uintptr_t>(buf.data()), buf.size(), 0, "");
+        nixlBackendMD *dram_md = nullptr;
+        if (eng.registerMem(dram_desc, DRAM_SEG, dram_md) != NIXL_SUCCESS) {
+            std::cerr << "FAIL: registerMem(DRAM) for cross-mode postXfer test failed\n";
+            return 1;
+        }
+        nixl_meta_dlist_t local(DRAM_SEG);
+        local.addDesc(nixlMetaDesc(reinterpret_cast<uintptr_t>(buf.data()), buf.size(), 0, dram_md));
+        nixl_meta_dlist_t remote(OBJ_SEG);
+        remote.addDesc(nixlMetaDesc(0, buf.size(), 1, nullptr));
+
+        nixlBackendReqH *h = nullptr;
+        nixl_status_t pp = eng.prepXfer(NIXL_WRITE, local, remote, init.localAgent, h);
+        nixl_status_t ps = NIXL_SUCCESS, cs = NIXL_SUCCESS;
+        if (pp == NIXL_SUCCESS) {
+            ps = eng.postXfer(NIXL_WRITE, local, remote, init.localAgent, h);
+            cs = eng.checkXfer(h);
+            eng.releaseReqH(h);
+        }
+        eng.deregisterMem(dram_md);
+        if (ps != NIXL_ERR_NOT_SUPPORTED) {
+            std::cerr << "FAIL: postXfer(OBJ_SEG) on a block engine was not refused with "
+                         "NIXL_ERR_NOT_SUPPORTED (prep=" << pp << " post=" << ps
+                      << " check=" << cs << ")\n";
+            return 1;
+        }
+        std::cout << "cross-mode guard OK: block-mode engine refuses OBJ_SEG at "
+                     "getSupportedMems/registerMem/queryMem/postXfer (no wild-LBA KV op)\n";
+    }
+
     std::cout << "spdk_kv_block_roundtrip_test: PASS\n";
     return 0;
 }
