@@ -10,6 +10,10 @@
 # over-single-op-bound (68 MiB), and out-of-capacity ranges are cleanly rejected
 # (not split).
 #
+# The nvmf_tgt bring-up/teardown (sock dir, cleanup trap, launch, RPC poll,
+# VFIOUSER transport + listener) is shared via tgt_common.sh; this script keeps
+# only its malloc-bdev/namespace RPCs and the test invocation.
+#
 # Env overrides:
 #   SPDK_ROOT  (required) path to a target-capable SPDK build providing a built
 #              build/bin/nvmf_tgt with the malloc bdev module and the block nvmf
@@ -30,39 +34,22 @@ TEST_BIN="$(readlink -f "$TEST_BIN")"
 BLOCK_SIZE="${BLOCK_SIZE:-512}"
 DEV_SIZE_MB="${DEV_SIZE_MB:-128}"
 
+source "$(dirname "$0")/tgt_common.sh"
+
 nqn="nqn.2026-06.io.spdk:spdk-blk-cnode0"
 bdev_name="SpdkBlkMalloc0"
-sock_dir="$(mktemp -d /tmp/spdk_blk_rt.XXXXXX)"
-muser_dir="$sock_dir/domain/muser0/0"
-rpc_sock="$sock_dir/rpc.sock"
-rpc_py="$SPDK_ROOT/scripts/rpc.py -s $rpc_sock"
-mkdir -p "$muser_dir"
+tgt_setup spdk_blk_rt
 
-nvmfpid=""
-cleanup() {
-    [[ -n "$nvmfpid" ]] && kill "$nvmfpid" 2>/dev/null || true
-    rm -rf "$sock_dir"
-}
-trap cleanup EXIT
-
-echo "== starting nvmf_tgt =="
 # -s 1536: headroom for the malloc bdev backing store plus mapping the client's
 # up-to-~64 MiB DMA staging region (the region-bounded SGL large-transfer path).
-"$SPDK_ROOT/build/bin/nvmf_tgt" -r "$rpc_sock" -m 0x1 --no-huge -s 1536 &
-nvmfpid=$!
-
-# Wait for the RPC socket to be ready.
-for _ in $(seq 1 50); do
-    if $rpc_py rpc_get_methods >/dev/null 2>&1; then break; fi
-    sleep 0.2
-done
+tgt_start 1536
 
 echo "== configuring block (NVM) namespace over VFIOUSER =="
-$rpc_py nvmf_create_transport -t VFIOUSER
+tgt_create_vfiouser_transport
 $rpc_py bdev_malloc_create -b "$bdev_name" "$DEV_SIZE_MB" "$BLOCK_SIZE"
 $rpc_py nvmf_create_subsystem "$nqn" -s SPDKBLK001 -a
 $rpc_py nvmf_subsystem_add_ns "$nqn" "$bdev_name"
-$rpc_py nvmf_subsystem_add_listener "$nqn" -t VFIOUSER -a "$muser_dir" -s 0
+tgt_add_vfiouser_listener "$nqn"
 
 echo "== running block round-trip test =="
 "$TEST_BIN" "trtype:VFIOUSER traddr:$muser_dir"

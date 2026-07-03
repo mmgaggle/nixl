@@ -16,6 +16,10 @@
 # with -ENOTSUP so init fails informatively instead of the payload/SGL mismatch
 # faulting mid-transfer. Full metadata / DIF/DIX support is out of scope.
 #
+# The nvmf_tgt bring-up/teardown (sock dir, cleanup trap, launch, RPC poll,
+# VFIOUSER transport + listener) is shared via tgt_common.sh; this script keeps
+# only its metadata-malloc-bdev/namespace RPCs and the refusal assertions.
+#
 # Env overrides:
 #   SPDK_ROOT  (required) path to a target-capable SPDK build providing a built
 #              build/bin/nvmf_tgt whose bdev_malloc_create supports the metadata
@@ -36,30 +40,13 @@ BLOCK_SIZE="${BLOCK_SIZE:-512}"
 MD_SIZE="${MD_SIZE:-8}"
 DEV_SIZE_MB="${DEV_SIZE_MB:-64}"
 
+source "$(dirname "$0")/tgt_common.sh"
+
 nqn="nqn.2026-06.io.spdk:spdk-blkmd-cnode0"
 bdev_name="SpdkBlkMdMalloc0"
-sock_dir="$(mktemp -d /tmp/spdk_blkmd_rt.XXXXXX)"
-muser_dir="$sock_dir/domain/muser0/0"
-rpc_sock="$sock_dir/rpc.sock"
-rpc_py="$SPDK_ROOT/scripts/rpc.py -s $rpc_sock"
-mkdir -p "$muser_dir"
+tgt_setup spdk_blkmd_rt
 
-nvmfpid=""
-cleanup() {
-    [[ -n "$nvmfpid" ]] && kill "$nvmfpid" 2>/dev/null || true
-    rm -rf "$sock_dir"
-}
-trap cleanup EXIT
-
-echo "== starting nvmf_tgt =="
-"$SPDK_ROOT/build/bin/nvmf_tgt" -r "$rpc_sock" -m 0x1 --no-huge -s 1024 &
-nvmfpid=$!
-
-# Wait for the RPC socket to be ready.
-for _ in $(seq 1 50); do
-    if $rpc_py rpc_get_methods >/dev/null 2>&1; then break; fi
-    sleep 0.2
-done
+tgt_start 1024
 
 # Create a malloc bdev with INTERLEAVED per-LBA metadata: the extended sector
 # size is BLOCK_SIZE + MD_SIZE, so extended_sector_size > sector_size and the
@@ -67,7 +54,7 @@ done
 # the guard cannot be exercised here -- report and skip cleanly (rc 0) rather than
 # fail, so the harness treats "no metadata-capable target" as not-applicable.
 echo "== configuring metadata (interleaved / extended-LBA) block namespace =="
-$rpc_py nvmf_create_transport -t VFIOUSER
+tgt_create_vfiouser_transport
 if ! $rpc_py bdev_malloc_create -b "$bdev_name" -m "$MD_SIZE" -i "$DEV_SIZE_MB" "$BLOCK_SIZE"; then
     echo "SKIP: this SPDK build cannot create a metadata-formatted malloc bdev" >&2
     echo "SKIP: block metadata-rejection guard not exercised (no metadata-capable target)" >&2
@@ -77,7 +64,7 @@ $rpc_py nvmf_create_subsystem "$nqn" -s SPDKBLKMD01 -a
 # Do NOT pass --hide-metadata: the host must SEE the metadata format so the guard
 # (md_size > 0) fires.
 $rpc_py nvmf_subsystem_add_ns "$nqn" "$bdev_name"
-$rpc_py nvmf_subsystem_add_listener "$nqn" -t VFIOUSER -a "$muser_dir" -s 0
+tgt_add_vfiouser_listener "$nqn"
 
 echo "== running block round-trip test (expecting CLEAN refusal at init) =="
 set +e

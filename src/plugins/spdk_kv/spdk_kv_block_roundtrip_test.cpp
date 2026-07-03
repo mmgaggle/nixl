@@ -59,180 +59,14 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
-#include <optional>
 #include <string>
 #include <vector>
 
-#include "nixl_descriptors.h"
-#include "backend/backend_aux.h"
-#include "spdk_kv_backend.h"
+#include "spdk_kv_test_common.h"
 
-extern "C" {
-#include "spdk_kv_shim.h" // SPDK_KV_SHIM_MAX_VALUE_LEN (the single-op bound)
-}
+using namespace spdk_kv_test;
 
 namespace {
-
-bool
-checkComplete(const nixlSpdkKvEngine &eng, nixlBackendReqH *h) {
-    // Shim ops are synchronous; checkXfer should report SUCCESS immediately.
-    for (int i = 0; i < 1000; ++i) {
-        nixl_status_t s = eng.checkXfer(h);
-        if (s == NIXL_SUCCESS) return true;
-        if (s != NIXL_IN_PROG) {
-            std::cerr << "checkXfer error status=" << s << "\n";
-            return false;
-        }
-    }
-    std::cerr << "checkXfer never completed\n";
-    return false;
-}
-
-// Write a `size`-byte pattern to the block namespace at `lba`, read it back into
-// a separate DRAM buffer, and verify the bytes match byte-for-byte. The pattern
-// depends on both offset and lba so a mis-addressed or mis-staged transfer would
-// corrupt the comparison.
-bool
-writeReadVerify(nixlSpdkKvEngine &eng, const std::string &agent, uint64_t lba, size_t size) {
-    std::vector<uint8_t> src(size), dst(size, 0);
-    for (size_t i = 0; i < size; ++i) {
-        src[i] = static_cast<uint8_t>((i * 2654435761u + static_cast<uint32_t>(lba) * 40503u) >> 13);
-    }
-    const uint64_t dram_dev = 0, blk_dev = 1;
-
-    nixlBlobDesc src_desc(reinterpret_cast<uintptr_t>(src.data()), size, dram_dev, "");
-    nixlBackendMD *src_md = nullptr;
-    nixlBlobDesc dst_desc(reinterpret_cast<uintptr_t>(dst.data()), size, dram_dev, "");
-    nixlBackendMD *dst_md = nullptr;
-    nixlBlobDesc blk_desc(lba, size, blk_dev, ""); // addr == LBA, no key
-    nixlBackendMD *blk_md = nullptr;
-    if (eng.registerMem(src_desc, DRAM_SEG, src_md) != NIXL_SUCCESS ||
-        eng.registerMem(dst_desc, DRAM_SEG, dst_md) != NIXL_SUCCESS ||
-        eng.registerMem(blk_desc, BLK_SEG, blk_md) != NIXL_SUCCESS) {
-        std::cerr << "FAIL: registerMem failed for size " << size << "\n";
-        return false;
-    }
-
-    nixl_meta_dlist_t local(DRAM_SEG);
-    local.addDesc(nixlMetaDesc(reinterpret_cast<uintptr_t>(src.data()), size, dram_dev, src_md));
-    nixl_meta_dlist_t remote(BLK_SEG);
-    remote.addDesc(nixlMetaDesc(lba, size, blk_dev, blk_md));
-    nixl_meta_dlist_t local_dst(DRAM_SEG);
-    local_dst.addDesc(nixlMetaDesc(reinterpret_cast<uintptr_t>(dst.data()), size, dram_dev, dst_md));
-
-    bool ok = false;
-    do {
-        // WRITE => block write
-        nixlBackendReqH *h = nullptr;
-        if (eng.prepXfer(NIXL_WRITE, local, remote, agent, h) != NIXL_SUCCESS) break;
-        nixl_status_t ps = eng.postXfer(NIXL_WRITE, local, remote, agent, h);
-        if (ps != NIXL_SUCCESS && ps != NIXL_IN_PROG) {
-            eng.releaseReqH(h);
-            break;
-        }
-        if (!checkComplete(eng, h)) {
-            eng.releaseReqH(h);
-            break;
-        }
-        eng.releaseReqH(h);
-
-        // READ => block read
-        h = nullptr;
-        if (eng.prepXfer(NIXL_READ, local_dst, remote, agent, h) != NIXL_SUCCESS) break;
-        ps = eng.postXfer(NIXL_READ, local_dst, remote, agent, h);
-        if (ps != NIXL_SUCCESS && ps != NIXL_IN_PROG) {
-            eng.releaseReqH(h);
-            break;
-        }
-        if (!checkComplete(eng, h)) {
-            eng.releaseReqH(h);
-            break;
-        }
-        eng.releaseReqH(h);
-
-        ok = (src == dst);
-    } while (0);
-
-    eng.deregisterMem(blk_md);
-    eng.deregisterMem(dst_md);
-    eng.deregisterMem(src_md);
-    return ok;
-}
-
-// Zero-copy variant of writeReadVerify: source/destination come from SPDK-DMA
-// memory (spdk_kv_shim_dma_alloc -> fd-backed, reachable by the vfio-user
-// target), so registerMem takes the DIRECT block datapath -- the device DMAs
-// straight to/from the caller's own buffer, no staging copy. Asserts the engine
-// reports zero-copy, then write+read `size` bytes at `lba` byte-exact.
-bool
-writeReadVerifyDirect(nixlSpdkKvEngine &eng, const std::string &agent, uint64_t lba, size_t size) {
-    void *src = spdk_kv_shim_dma_alloc(size);
-    void *dst = spdk_kv_shim_dma_alloc(size);
-    if (src == nullptr || dst == nullptr) {
-        std::cerr << "FAIL: dma_alloc(" << size << ") for zero-copy block test\n";
-        spdk_kv_shim_dma_free(src);
-        spdk_kv_shim_dma_free(dst);
-        return false;
-    }
-    auto *src_b = static_cast<uint8_t *>(src);
-    for (size_t i = 0; i < size; ++i) {
-        src_b[i] = static_cast<uint8_t>((i * 2654435761u + static_cast<uint32_t>(lba) * 40503u) >> 13);
-    }
-    std::memset(dst, 0, size);
-    const uint64_t dram_dev = 0, blk_dev = 1;
-
-    nixlBlobDesc src_desc(reinterpret_cast<uintptr_t>(src), size, dram_dev, "");
-    nixlBackendMD *src_md = nullptr;
-    nixlBlobDesc dst_desc(reinterpret_cast<uintptr_t>(dst), size, dram_dev, "");
-    nixlBackendMD *dst_md = nullptr;
-    nixlBlobDesc blk_desc(lba, size, blk_dev, ""); // addr == LBA, no key
-    nixlBackendMD *blk_md = nullptr;
-
-    bool ok = false;
-    do {
-        if (eng.registerMem(src_desc, DRAM_SEG, src_md) != NIXL_SUCCESS ||
-            eng.registerMem(dst_desc, DRAM_SEG, dst_md) != NIXL_SUCCESS ||
-            eng.registerMem(blk_desc, BLK_SEG, blk_md) != NIXL_SUCCESS) {
-            std::cerr << "FAIL: registerMem (zero-copy block) failed for size " << size << "\n";
-            break;
-        }
-        if (!eng.dramIsDmaRegistered(src_md) || !eng.dramIsDmaRegistered(dst_md)) {
-            std::cerr << "FAIL: expected zero-copy DMA path for SPDK-DMA block buffers (size "
-                      << size << ")\n";
-            break;
-        }
-
-        nixl_meta_dlist_t local(DRAM_SEG);
-        local.addDesc(nixlMetaDesc(reinterpret_cast<uintptr_t>(src), size, dram_dev, src_md));
-        nixl_meta_dlist_t remote(BLK_SEG);
-        remote.addDesc(nixlMetaDesc(lba, size, blk_dev, blk_md));
-        nixl_meta_dlist_t local_dst(DRAM_SEG);
-        local_dst.addDesc(nixlMetaDesc(reinterpret_cast<uintptr_t>(dst), size, dram_dev, dst_md));
-
-        nixlBackendReqH *h = nullptr;
-        if (eng.prepXfer(NIXL_WRITE, local, remote, agent, h) != NIXL_SUCCESS) break;
-        nixl_status_t ps = eng.postXfer(NIXL_WRITE, local, remote, agent, h);
-        if (ps != NIXL_SUCCESS && ps != NIXL_IN_PROG) { eng.releaseReqH(h); break; }
-        if (!checkComplete(eng, h)) { eng.releaseReqH(h); break; }
-        eng.releaseReqH(h);
-
-        h = nullptr;
-        if (eng.prepXfer(NIXL_READ, local_dst, remote, agent, h) != NIXL_SUCCESS) break;
-        ps = eng.postXfer(NIXL_READ, local_dst, remote, agent, h);
-        if (ps != NIXL_SUCCESS && ps != NIXL_IN_PROG) { eng.releaseReqH(h); break; }
-        if (!checkComplete(eng, h)) { eng.releaseReqH(h); break; }
-        eng.releaseReqH(h);
-
-        ok = (std::memcmp(src, dst, size) == 0);
-    } while (0);
-
-    eng.deregisterMem(blk_md);
-    eng.deregisterMem(dst_md);
-    eng.deregisterMem(src_md);
-    spdk_kv_shim_dma_free(src);
-    spdk_kv_shim_dma_free(dst);
-    return ok;
-}
 
 // Attempt a WRITE of `size` bytes at `lba` and assert the engine REJECTS it with
 // the SPECIFIC status `expected` -- not merely "some non-success". Checks that
@@ -317,15 +151,7 @@ blockOp(nixlSpdkKvEngine &eng, const std::string &agent, nixl_xfer_op_t op, uint
     nixl_meta_dlist_t remote(BLK_SEG);
     remote.addDesc(nixlMetaDesc(lba, size, blk_dev, blk_md));
 
-    bool ok = false;
-    nixlBackendReqH *h = nullptr;
-    if (eng.prepXfer(op, local, remote, agent, h) == NIXL_SUCCESS) {
-        nixl_status_t ps = eng.postXfer(op, local, remote, agent, h);
-        if ((ps == NIXL_SUCCESS || ps == NIXL_IN_PROG) && checkComplete(eng, h)) {
-            ok = true;
-        }
-        eng.releaseReqH(h);
-    }
+    bool ok = doXfer(eng, op, local, remote, agent);
     eng.deregisterMem(blk_md);
     eng.deregisterMem(dram_md);
     return ok;
@@ -339,34 +165,17 @@ main(int argc, char **argv) {
         std::cerr << "usage: " << argv[0] << " <transport-id-or-vfio-user-dir>\n";
         return 2;
     }
-    // Accept either a full SPDK transport ID (contains "trtype:") or a bare
-    // vfio-user socket directory, which the engine wraps into a VFIOUSER trid.
-    const std::string arg = argv[1];
+    const char *kAgent = "spdk_block_test_agent";
+    const std::string agent = kAgent;
 
-    nixl_b_params_t params;
-    if (arg.find("trtype:") != std::string::npos) {
-        params["transport_id"] = arg;
-    } else {
-        params["vfu_addr"] = arg;
-    }
     // Bind a CSI==NVM block namespace (the LBA/KV knob) and bring up our own env.
-    params["csi"] = "block";
-    params["init_env"] = "true";
-
-    nixlBackendInitParams init{};
-    init.localAgent = "spdk_block_test_agent";
-    init.type = "SPDK";
-    init.customParams = &params;
-    init.enableProgTh = false;
-    init.pthrDelay = 0;
-    init.enableTelemetry_ = false;
-
-    nixlSpdkKvEngine eng(&init);
-    if (eng.getInitErr()) {
+    auto eng_ptr = makeEngine(argv[1], kAgent, /*block=*/true);
+    if (!eng_ptr) {
         std::cerr << "FAIL: engine init error (block shim open failed)\n";
         return 1;
     }
-    std::cout << "engine initialized (block mode) against '" << arg << "'\n";
+    nixlSpdkKvEngine &eng = *eng_ptr;
+    std::cout << "engine initialized (block mode) against '" << argv[1] << "'\n";
 
     // --- Block round-trip across sizes (4 KiB .. ~60 MiB) ---
     // All multiples of 4096, so valid for a 512- or 4096-byte-sector namespace.
@@ -379,7 +188,7 @@ main(int argc, char **argv) {
         const size_t sizes[] = {4 * KiB, 8 * KiB, 64 * KiB, 256 * KiB, 1 * MiB,
                                 2 * MiB, 8 * MiB, 60 * MiB};
         for (size_t sz : sizes) {
-            if (!writeReadVerify(eng, init.localAgent, /*lba=*/0, sz)) {
+            if (!writeReadVerify(eng, agent, /*lba=*/0, sz)) {
                 std::cerr << "FAIL: block round-trip failed at LBA 0 for " << sz << " bytes\n";
                 return 1;
             }
@@ -393,7 +202,7 @@ main(int argc, char **argv) {
     {
         const size_t sz = 4096;
         const uint64_t lba = 8;
-        if (!writeReadVerify(eng, init.localAgent, lba, sz)) {
+        if (!writeReadVerify(eng, agent, lba, sz)) {
             std::cerr << "FAIL: block round-trip failed at LBA " << lba << "\n";
             return 1;
         }
@@ -414,7 +223,7 @@ main(int argc, char **argv) {
             {0, 8 * MiB}, // 4 x 2 MiB regions, zero-copy large block transfer
         };
         for (const auto &c : zc) {
-            if (!writeReadVerifyDirect(eng, init.localAgent, c.lba, c.size)) {
+            if (!writeReadVerify(eng, agent, c.lba, c.size, BufKind::Dma, /*expect_direct=*/true)) {
                 std::cerr << "FAIL: zero-copy block round-trip failed (" << c.size
                           << " bytes at LBA " << c.lba << ")\n";
                 return 1;
@@ -443,15 +252,15 @@ main(int argc, char **argv) {
 
         // Write A to lba_a, then B to lba_b (disjoint, so B must not clobber A).
         std::vector<uint8_t> wa = pat_a, wb = pat_b;
-        if (!blockOp(eng, init.localAgent, NIXL_WRITE, lba_a, wa) ||
-            !blockOp(eng, init.localAgent, NIXL_WRITE, lba_b, wb)) {
+        if (!blockOp(eng, agent, NIXL_WRITE, lba_a, wa) ||
+            !blockOp(eng, agent, NIXL_WRITE, lba_b, wb)) {
             std::cerr << "FAIL: distinct-LBA writes failed\n";
             return 1;
         }
         // Read each range back; each must return its OWN pattern.
         std::vector<uint8_t> ra(sz, 0), rb(sz, 0);
-        if (!blockOp(eng, init.localAgent, NIXL_READ, lba_a, ra) ||
-            !blockOp(eng, init.localAgent, NIXL_READ, lba_b, rb)) {
+        if (!blockOp(eng, agent, NIXL_READ, lba_a, ra) ||
+            !blockOp(eng, agent, NIXL_READ, lba_b, rb)) {
             std::cerr << "FAIL: distinct-LBA reads failed\n";
             return 1;
         }
@@ -521,7 +330,7 @@ main(int argc, char **argv) {
 
         // ONE large WRITE of all 4 regions at LBA 0.
         std::vector<uint8_t> wbig = big;
-        if (!blockOp(eng, init.localAgent, NIXL_WRITE, /*lba=*/0, wbig)) {
+        if (!blockOp(eng, agent, NIXL_WRITE, /*lba=*/0, wbig)) {
             std::cerr << "FAIL: large multi-region WRITE at LBA 0 failed\n";
             return 1;
         }
@@ -532,7 +341,7 @@ main(int argc, char **argv) {
         for (size_t k = 0; k < regions; ++k) {
             std::vector<uint8_t> rk(region, 0);
             const uint64_t lba = static_cast<uint64_t>(k) * lba_per_region;
-            if (!blockOp(eng, init.localAgent, NIXL_READ, lba, rk)) {
+            if (!blockOp(eng, agent, NIXL_READ, lba, rk)) {
                 std::cerr << "FAIL: independent region READ failed (region " << k
                           << ", LBA " << lba << ")\n";
                 return 1;
@@ -556,7 +365,7 @@ main(int argc, char **argv) {
     {
         // Length not a multiple of the sector size (odd offset from a 4 KiB base;
         // not a multiple of 512, so misaligned on any real sector size).
-        if (!expectReject(eng, init.localAgent, /*lba=*/0, 4096 + 7, NIXL_ERR_INVALID_PARAM)) {
+        if (!expectReject(eng, agent, /*lba=*/0, 4096 + 7, NIXL_ERR_INVALID_PARAM)) {
             std::cerr << "FAIL: sector-misaligned length reject\n";
             return 1;
         }
@@ -568,7 +377,7 @@ main(int argc, char **argv) {
         // staged (proving the reject is not a partial/striped transfer).
         const size_t oversize =
             static_cast<size_t>(SPDK_KV_SHIM_MAX_VALUE_LEN) + 4 * 1024 * 1024;
-        if (!expectReject(eng, init.localAgent, /*lba=*/0, oversize, NIXL_ERR_INVALID_PARAM)) {
+        if (!expectReject(eng, agent, /*lba=*/0, oversize, NIXL_ERR_INVALID_PARAM)) {
             std::cerr << "FAIL: over-single-op-bound length (" << oversize << " B) reject\n";
             return 1;
         }
@@ -578,7 +387,7 @@ main(int argc, char **argv) {
 
         // LBA range past the namespace capacity (well beyond any malloc bdev here).
         const uint64_t far_lba = 1ull << 40;
-        if (!expectReject(eng, init.localAgent, far_lba, 4096, NIXL_ERR_INVALID_PARAM)) {
+        if (!expectReject(eng, agent, far_lba, 4096, NIXL_ERR_INVALID_PARAM)) {
             std::cerr << "FAIL: out-of-capacity LBA " << far_lba << " reject\n";
             return 1;
         }
@@ -661,10 +470,10 @@ main(int argc, char **argv) {
         remote.addDesc(nixlMetaDesc(0, buf.size(), 1, nullptr));
 
         nixlBackendReqH *h = nullptr;
-        nixl_status_t pp = eng.prepXfer(NIXL_WRITE, local, remote, init.localAgent, h);
+        nixl_status_t pp = eng.prepXfer(NIXL_WRITE, local, remote, agent, h);
         nixl_status_t ps = NIXL_SUCCESS, cs = NIXL_SUCCESS;
         if (pp == NIXL_SUCCESS) {
-            ps = eng.postXfer(NIXL_WRITE, local, remote, init.localAgent, h);
+            ps = eng.postXfer(NIXL_WRITE, local, remote, agent, h);
             cs = eng.checkXfer(h);
             eng.releaseReqH(h);
         }

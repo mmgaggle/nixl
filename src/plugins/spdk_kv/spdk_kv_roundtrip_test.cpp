@@ -45,178 +45,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
-#include <optional>
 #include <string>
 #include <vector>
 
 #include <sys/mman.h> // mmap/munmap for the partial-reachability construction
 
-#include "nixl_descriptors.h"
-#include "backend/backend_aux.h"
-#include "spdk_kv_backend.h"
+#include "spdk_kv_test_common.h"
 
-extern "C" {
-#include "spdk_kv_shim.h" // SPDK_KV_SHIM_MAX_VALUE_LEN (the single-op bound)
-}
-
-namespace {
-
-bool
-checkComplete(const nixlSpdkKvEngine &eng, nixlBackendReqH *h) {
-    // Shim ops are synchronous; checkXfer should report SUCCESS immediately.
-    for (int i = 0; i < 1000; ++i) {
-        nixl_status_t s = eng.checkXfer(h);
-        if (s == NIXL_SUCCESS) return true;
-        if (s != NIXL_IN_PROG) {
-            std::cerr << "checkXfer error status=" << s << "\n";
-            return false;
-        }
-    }
-    std::cerr << "checkXfer never completed\n";
-    return false;
-}
-
-// Store then Retrieve a `size`-byte value under `key`, verifying the retrieved
-// bytes match byte-for-byte. Fills the source with a size-dependent pattern so a
-// mis-scattered region would corrupt the comparison. Used to exercise the
-// region-bounded SGL across sizes that span several 2 MiB DMA regions.
-bool
-storeRetrieveVerify(nixlSpdkKvEngine &eng, const std::string &agent,
-                    const std::string &key, size_t size) {
-    std::vector<uint8_t> src(size), dst(size, 0);
-    for (size_t i = 0; i < size; ++i) {
-        src[i] = static_cast<uint8_t>((i * 1103515245u + 12345u) >> 16);
-    }
-    const uint64_t dram_dev = 0, key_dev = 1;
-
-    nixlBlobDesc src_desc(reinterpret_cast<uintptr_t>(src.data()), size, dram_dev, "");
-    nixlBackendMD *src_md = nullptr;
-    nixlBlobDesc dst_desc(reinterpret_cast<uintptr_t>(dst.data()), size, dram_dev, "");
-    nixlBackendMD *dst_md = nullptr;
-    nixlBlobDesc key_desc(0, size, key_dev, key);
-    nixlBackendMD *key_md = nullptr;
-    if (eng.registerMem(src_desc, DRAM_SEG, src_md) != NIXL_SUCCESS ||
-        eng.registerMem(dst_desc, DRAM_SEG, dst_md) != NIXL_SUCCESS ||
-        eng.registerMem(key_desc, OBJ_SEG, key_md) != NIXL_SUCCESS) {
-        std::cerr << "FAIL: registerMem failed for size " << size << "\n";
-        return false;
-    }
-
-    nixl_meta_dlist_t local(DRAM_SEG);
-    local.addDesc(nixlMetaDesc(reinterpret_cast<uintptr_t>(src.data()), size, dram_dev, src_md));
-    nixl_meta_dlist_t remote(OBJ_SEG);
-    remote.addDesc(nixlMetaDesc(0, size, key_dev, key_md));
-    nixl_meta_dlist_t local_dst(DRAM_SEG);
-    local_dst.addDesc(nixlMetaDesc(reinterpret_cast<uintptr_t>(dst.data()), size, dram_dev, dst_md));
-
-    bool ok = false;
-    do {
-        // WRITE => KV Store
-        nixlBackendReqH *h = nullptr;
-        if (eng.prepXfer(NIXL_WRITE, local, remote, agent, h) != NIXL_SUCCESS) break;
-        nixl_status_t ps = eng.postXfer(NIXL_WRITE, local, remote, agent, h);
-        if (ps != NIXL_SUCCESS && ps != NIXL_IN_PROG) { eng.releaseReqH(h); break; }
-        if (!checkComplete(eng, h)) { eng.releaseReqH(h); break; }
-        eng.releaseReqH(h);
-
-        // READ => KV Retrieve
-        h = nullptr;
-        if (eng.prepXfer(NIXL_READ, local_dst, remote, agent, h) != NIXL_SUCCESS) break;
-        ps = eng.postXfer(NIXL_READ, local_dst, remote, agent, h);
-        if (ps != NIXL_SUCCESS && ps != NIXL_IN_PROG) { eng.releaseReqH(h); break; }
-        if (!checkComplete(eng, h)) { eng.releaseReqH(h); break; }
-        eng.releaseReqH(h);
-
-        ok = (src == dst);
-    } while (0);
-
-    eng.deregisterMem(key_md);
-    eng.deregisterMem(dst_md);
-    eng.deregisterMem(src_md);
-    return ok;
-}
-
-// Zero-copy variant of storeRetrieveVerify: the source/destination come from
-// SPDK-DMA memory (spdk_kv_shim_dma_alloc -> fd-backed, reachable by the
-// vfio-user target), so registerMem takes the DIRECT datapath -- the device DMAs
-// into the caller's own buffer with NO staging copy. Asserts the engine reports
-// zero-copy for both buffers, then Store+Retrieve `size` bytes byte-exact. Proves
-// the direct-DMA path end-to-end (incl. multi-region large values).
-bool
-storeRetrieveVerifyDirect(nixlSpdkKvEngine &eng, const std::string &agent,
-                          const std::string &key, size_t size) {
-    void *src = spdk_kv_shim_dma_alloc(size);
-    void *dst = spdk_kv_shim_dma_alloc(size);
-    if (src == nullptr || dst == nullptr) {
-        std::cerr << "FAIL: dma_alloc(" << size << ") for zero-copy test\n";
-        spdk_kv_shim_dma_free(src);
-        spdk_kv_shim_dma_free(dst);
-        return false;
-    }
-    auto *src_b = static_cast<uint8_t *>(src);
-    for (size_t i = 0; i < size; ++i) {
-        src_b[i] = static_cast<uint8_t>((i * 2246822519u + 3266489917u) >> 13);
-    }
-    std::memset(dst, 0, size);
-    const uint64_t dram_dev = 0, key_dev = 1;
-
-    nixlBlobDesc src_desc(reinterpret_cast<uintptr_t>(src), size, dram_dev, "");
-    nixlBackendMD *src_md = nullptr;
-    nixlBlobDesc dst_desc(reinterpret_cast<uintptr_t>(dst), size, dram_dev, "");
-    nixlBackendMD *dst_md = nullptr;
-    nixlBlobDesc key_desc(0, size, key_dev, key);
-    nixlBackendMD *key_md = nullptr;
-
-    bool ok = false;
-    do {
-        if (eng.registerMem(src_desc, DRAM_SEG, src_md) != NIXL_SUCCESS ||
-            eng.registerMem(dst_desc, DRAM_SEG, dst_md) != NIXL_SUCCESS ||
-            eng.registerMem(key_desc, OBJ_SEG, key_md) != NIXL_SUCCESS) {
-            std::cerr << "FAIL: registerMem (zero-copy) failed for size " << size << "\n";
-            break;
-        }
-        // The whole point: SPDK-DMA buffers MUST take the zero-copy datapath.
-        if (!eng.dramIsDmaRegistered(src_md) || !eng.dramIsDmaRegistered(dst_md)) {
-            std::cerr << "FAIL: expected zero-copy DMA path for SPDK-DMA buffers (size "
-                      << size << ")\n";
-            break;
-        }
-
-        nixl_meta_dlist_t local(DRAM_SEG);
-        local.addDesc(nixlMetaDesc(reinterpret_cast<uintptr_t>(src), size, dram_dev, src_md));
-        nixl_meta_dlist_t remote(OBJ_SEG);
-        remote.addDesc(nixlMetaDesc(0, size, key_dev, key_md));
-        nixl_meta_dlist_t local_dst(DRAM_SEG);
-        local_dst.addDesc(nixlMetaDesc(reinterpret_cast<uintptr_t>(dst), size, dram_dev, dst_md));
-
-        // WRITE => KV Store (direct DMA from src)
-        nixlBackendReqH *h = nullptr;
-        if (eng.prepXfer(NIXL_WRITE, local, remote, agent, h) != NIXL_SUCCESS) break;
-        nixl_status_t ps = eng.postXfer(NIXL_WRITE, local, remote, agent, h);
-        if (ps != NIXL_SUCCESS && ps != NIXL_IN_PROG) { eng.releaseReqH(h); break; }
-        if (!checkComplete(eng, h)) { eng.releaseReqH(h); break; }
-        eng.releaseReqH(h);
-
-        // READ => KV Retrieve (device DMAs directly into dst)
-        h = nullptr;
-        if (eng.prepXfer(NIXL_READ, local_dst, remote, agent, h) != NIXL_SUCCESS) break;
-        ps = eng.postXfer(NIXL_READ, local_dst, remote, agent, h);
-        if (ps != NIXL_SUCCESS && ps != NIXL_IN_PROG) { eng.releaseReqH(h); break; }
-        if (!checkComplete(eng, h)) { eng.releaseReqH(h); break; }
-        eng.releaseReqH(h);
-
-        ok = (std::memcmp(src, dst, size) == 0);
-    } while (0);
-
-    eng.deregisterMem(key_md);
-    eng.deregisterMem(dst_md);
-    eng.deregisterMem(src_md);
-    spdk_kv_shim_dma_free(src);
-    spdk_kv_shim_dma_free(dst);
-    return ok;
-}
-
-} // namespace
+using namespace spdk_kv_test;
 
 int
 main(int argc, char **argv) {
@@ -224,33 +60,17 @@ main(int argc, char **argv) {
         std::cerr << "usage: " << argv[0] << " <transport-id-or-vfio-user-dir>\n";
         return 2;
     }
-    // Accept either a full SPDK transport ID (contains "trtype:") or a bare
-    // vfio-user socket directory, which the engine wraps into a VFIOUSER trid.
-    const std::string arg = argv[1];
+    const char *kAgent = "spdk_kv_test_agent";
+    const std::string agent = kAgent;
 
-    nixl_b_params_t params;
-    if (arg.find("trtype:") != std::string::npos) {
-        params["transport_id"] = arg;
-    } else {
-        params["vfu_addr"] = arg;
-    }
     // Standalone test: no host owns the SPDK env, so this engine brings it up.
-    params["init_env"] = "true";
-
-    nixlBackendInitParams init{};
-    init.localAgent = "spdk_kv_test_agent";
-    init.type = "SPDK";
-    init.customParams = &params;
-    init.enableProgTh = false;
-    init.pthrDelay = 0;
-    init.enableTelemetry_ = false;
-
-    nixlSpdkKvEngine eng(&init);
-    if (eng.getInitErr()) {
+    auto eng_ptr = makeEngine(argv[1], kAgent, /*block=*/false);
+    if (!eng_ptr) {
         std::cerr << "FAIL: engine init error (shim open failed)\n";
         return 1;
     }
-    std::cout << "engine initialized against '" << arg << "'\n";
+    nixlSpdkKvEngine &eng = *eng_ptr;
+    std::cout << "engine initialized against '" << argv[1] << "'\n";
 
     // --- Source / destination DRAM buffers ---
     const std::string payload = "SPDK_KV-NIXL-roundtrip-small-value-0123456789";
@@ -291,44 +111,18 @@ main(int argc, char **argv) {
         reinterpret_cast<uintptr_t>(dst.data()), dst.size(), dram_dev, dram_md));
 
     // --- WRITE => KV Store ---
-    {
-        nixlBackendReqH *h = nullptr;
-        if (eng.prepXfer(NIXL_WRITE, local, remote, init.localAgent, h) != NIXL_SUCCESS) {
-            std::cerr << "FAIL: prepXfer(WRITE) failed\n";
-            return 1;
-        }
-        nixl_status_t ps = eng.postXfer(NIXL_WRITE, local, remote, init.localAgent, h);
-        if (ps != NIXL_SUCCESS && ps != NIXL_IN_PROG) {
-            std::cerr << "FAIL: postXfer(WRITE) status=" << ps << "\n";
-            return 1;
-        }
-        if (!checkComplete(eng, h)) {
-            std::cerr << "FAIL: WRITE did not complete\n";
-            return 1;
-        }
-        eng.releaseReqH(h);
-        std::cout << "WRITE (KV Store) of " << src.size() << " bytes complete\n";
+    if (!doXfer(eng, NIXL_WRITE, local, remote, agent)) {
+        std::cerr << "FAIL: WRITE (KV Store) did not complete\n";
+        return 1;
     }
+    std::cout << "WRITE (KV Store) of " << src.size() << " bytes complete\n";
 
     // --- READ => KV Retrieve ---
-    {
-        nixlBackendReqH *h = nullptr;
-        if (eng.prepXfer(NIXL_READ, local_dst, remote, init.localAgent, h) != NIXL_SUCCESS) {
-            std::cerr << "FAIL: prepXfer(READ) failed\n";
-            return 1;
-        }
-        nixl_status_t ps = eng.postXfer(NIXL_READ, local_dst, remote, init.localAgent, h);
-        if (ps != NIXL_SUCCESS && ps != NIXL_IN_PROG) {
-            std::cerr << "FAIL: postXfer(READ) status=" << ps << "\n";
-            return 1;
-        }
-        if (!checkComplete(eng, h)) {
-            std::cerr << "FAIL: READ did not complete\n";
-            return 1;
-        }
-        eng.releaseReqH(h);
-        std::cout << "READ (KV Retrieve) of " << dst.size() << " bytes complete\n";
+    if (!doXfer(eng, NIXL_READ, local_dst, remote, agent)) {
+        std::cerr << "FAIL: READ (KV Retrieve) did not complete\n";
+        return 1;
     }
+    std::cout << "READ (KV Retrieve) of " << dst.size() << " bytes complete\n";
 
     // --- Verify byte-for-byte ---
     if (src != dst) {
@@ -406,11 +200,11 @@ main(int argc, char **argv) {
         s_remote.addDesc(nixlMetaDesc(0, short_len, key_dev, key_md));
 
         nixlBackendReqH *h = nullptr;
-        if (eng.prepXfer(NIXL_READ, s_local, s_remote, init.localAgent, h) != NIXL_SUCCESS) {
+        if (eng.prepXfer(NIXL_READ, s_local, s_remote, agent, h) != NIXL_SUCCESS) {
             std::cerr << "FAIL: prepXfer(short READ) failed\n";
             return 1;
         }
-        nixl_status_t ps = eng.postXfer(NIXL_READ, s_local, s_remote, init.localAgent, h);
+        nixl_status_t ps = eng.postXfer(NIXL_READ, s_local, s_remote, agent, h);
         nixl_status_t cs = eng.checkXfer(h);
         if (ps != NIXL_ERR_MISMATCH || cs != NIXL_ERR_MISMATCH) {
             std::cerr << "FAIL: short READ (" << short_len << " bytes) of a "
@@ -437,23 +231,10 @@ main(int argc, char **argv) {
         nixl_meta_dlist_t r_remote(OBJ_SEG);
         r_remote.addDesc(nixlMetaDesc(0, true_len, key_dev, key_md));
 
-        nixlBackendReqH *rh = nullptr;
-        if (eng.prepXfer(NIXL_READ, r_local, r_remote, init.localAgent, rh) != NIXL_SUCCESS) {
-            std::cerr << "FAIL: prepXfer(resized READ) failed\n";
-            return 1;
-        }
-        nixl_status_t rps = eng.postXfer(NIXL_READ, r_local, r_remote, init.localAgent, rh);
-        if (rps != NIXL_SUCCESS && rps != NIXL_IN_PROG) {
-            std::cerr << "FAIL: postXfer(resized READ) status=" << rps << "\n";
-            eng.releaseReqH(rh);
-            return 1;
-        }
-        if (!checkComplete(eng, rh)) {
+        if (!doXfer(eng, NIXL_READ, r_local, r_remote, agent)) {
             std::cerr << "FAIL: resized READ did not complete\n";
-            eng.releaseReqH(rh);
             return 1;
         }
-        eng.releaseReqH(rh);
         if (resized_dst != src) {
             std::cerr << "FAIL: resized READ data mismatch after auto-sizing\n";
             return 1;
@@ -481,7 +262,7 @@ main(int argc, char **argv) {
             {"nixl-large-60mib", 60 * MiB},
         };
         for (const auto &c : cases) {
-            if (!storeRetrieveVerify(eng, init.localAgent, c.key, c.size)) {
+            if (!storeRetrieveVerify(eng, agent, c.key, c.size)) {
                 std::cerr << "FAIL: large-value round-trip failed for " << (c.size / MiB)
                           << " MiB (key '" << c.key << "')\n";
                 return 1;
@@ -524,14 +305,12 @@ main(int argc, char **argv) {
             l.addDesc(nixlMetaDesc(reinterpret_cast<uintptr_t>(big_src.data()), big_len, dram_dev, src_md));
             nixl_meta_dlist_t r(OBJ_SEG);
             r.addDesc(nixlMetaDesc(0, big_len, key_dev, k_md));
-            nixlBackendReqH *h = nullptr;
-            if (eng.prepXfer(NIXL_WRITE, l, r, init.localAgent, h) != NIXL_SUCCESS ||
-                (eng.postXfer(NIXL_WRITE, l, r, init.localAgent, h), !checkComplete(eng, h))) {
+            if (!doXfer(eng, NIXL_WRITE, l, r, agent)) {
                 std::cerr << "FAIL: large Store for auto-sizing case failed\n";
-                eng.releaseReqH(h);
+                eng.deregisterMem(k_md);
+                eng.deregisterMem(src_md);
                 return 1;
             }
-            eng.releaseReqH(h);
         }
 
         // Retrieve into a 1 MiB buffer: must report MISMATCH + true length 8 MiB.
@@ -541,11 +320,11 @@ main(int argc, char **argv) {
             nixl_meta_dlist_t r(OBJ_SEG);
             r.addDesc(nixlMetaDesc(0, small_len, key_dev, k_md));
             nixlBackendReqH *h = nullptr;
-            if (eng.prepXfer(NIXL_READ, l, r, init.localAgent, h) != NIXL_SUCCESS) {
+            if (eng.prepXfer(NIXL_READ, l, r, agent, h) != NIXL_SUCCESS) {
                 std::cerr << "FAIL: prepXfer(large too-small READ) failed\n";
                 return 1;
             }
-            nixl_status_t ps = eng.postXfer(NIXL_READ, l, r, init.localAgent, h);
+            nixl_status_t ps = eng.postXfer(NIXL_READ, l, r, agent, h);
             nixl_status_t cs = eng.checkXfer(h);
             const size_t tl = eng.getReqTrueLen(h, 0);
             eng.releaseReqH(h);
@@ -568,16 +347,12 @@ main(int argc, char **argv) {
             l.addDesc(nixlMetaDesc(reinterpret_cast<uintptr_t>(big_dst.data()), big_len, dram_dev, nullptr));
             nixl_meta_dlist_t r(OBJ_SEG);
             r.addDesc(nixlMetaDesc(0, big_len, key_dev, k_md));
-            nixlBackendReqH *h = nullptr;
-            if (eng.prepXfer(NIXL_READ, l, r, init.localAgent, h) != NIXL_SUCCESS ||
-                (eng.postXfer(NIXL_READ, l, r, init.localAgent, h), !checkComplete(eng, h))) {
+            if (!doXfer(eng, NIXL_READ, l, r, agent)) {
                 std::cerr << "FAIL: resized large READ failed\n";
-                eng.releaseReqH(h);
                 eng.deregisterMem(k_md);
                 eng.deregisterMem(src_md);
                 return 1;
             }
-            eng.releaseReqH(h);
             if (big_dst != big_src) {
                 std::cerr << "FAIL: resized large READ data mismatch after auto-sizing\n";
                 eng.deregisterMem(k_md);
@@ -616,10 +391,10 @@ main(int argc, char **argv) {
         remote.addDesc(nixlMetaDesc(0, oversize, key_dev, key_md2));
 
         nixlBackendReqH *h = nullptr;
-        nixl_status_t pp = eng.prepXfer(NIXL_WRITE, local, remote, init.localAgent, h);
+        nixl_status_t pp = eng.prepXfer(NIXL_WRITE, local, remote, agent, h);
         nixl_status_t ps = NIXL_SUCCESS, cs = NIXL_SUCCESS;
         if (pp == NIXL_SUCCESS) {
-            ps = eng.postXfer(NIXL_WRITE, local, remote, init.localAgent, h);
+            ps = eng.postXfer(NIXL_WRITE, local, remote, agent, h);
             cs = eng.checkXfer(h);
             eng.releaseReqH(h);
         }
@@ -648,7 +423,7 @@ main(int argc, char **argv) {
             {"nixl-zerocopy-8m", 8 * MiB}, // 4 x 2 MiB regions, zero-copy large value
         };
         for (const auto &c : zc) {
-            if (!storeRetrieveVerifyDirect(eng, init.localAgent, c.key, c.size)) {
+            if (!storeRetrieveVerify(eng, agent, c.key, c.size, BufKind::Dma, /*expect_direct=*/true)) {
                 std::cerr << "FAIL: zero-copy round-trip failed (key '" << c.key
                           << "', size " << c.size << ")\n";
                 return 1;
@@ -723,20 +498,9 @@ main(int argc, char **argv) {
             local.addDesc(nixlMetaDesc(reinterpret_cast<uintptr_t>(buf), sz, dram_dev, src_md));
             nixl_meta_dlist_t remote(OBJ_SEG);
             remote.addDesc(nixlMetaDesc(0, sz, key_dev, key_md));
-            nixlBackendReqH *h = nullptr;
-            bool round_ok = false;
-            if (eng.prepXfer(NIXL_WRITE, local, remote, init.localAgent, h) == NIXL_SUCCESS) {
-                eng.postXfer(NIXL_WRITE, local, remote, init.localAgent, h);
-                round_ok = checkComplete(eng, h);
-            }
-            eng.releaseReqH(h);
+            bool round_ok = doXfer(eng, NIXL_WRITE, local, remote, agent);
             std::memset(buf, 0, sz);
-            h = nullptr;
-            if (round_ok && eng.prepXfer(NIXL_READ, local, remote, init.localAgent, h) == NIXL_SUCCESS) {
-                eng.postXfer(NIXL_READ, local, remote, init.localAgent, h);
-                round_ok = checkComplete(eng, h);
-            }
-            eng.releaseReqH(h);
+            if (round_ok) round_ok = doXfer(eng, NIXL_READ, local, remote, agent);
             rc = (round_ok && std::memcmp(buf, expect.data(), sz) == 0) ? 0 : 2;
         }
         eng.deregisterMem(key_md);
@@ -844,21 +608,9 @@ main(int argc, char **argv) {
                     local.addDesc(nixlMetaDesc(reinterpret_cast<uintptr_t>(base), sz, dram_dev, src_md));
                     nixl_meta_dlist_t remote(OBJ_SEG);
                     remote.addDesc(nixlMetaDesc(0, sz, key_dev, key_md));
-                    nixlBackendReqH *h = nullptr;
-                    bool round_ok = false;
-                    if (eng.prepXfer(NIXL_WRITE, local, remote, init.localAgent, h) == NIXL_SUCCESS) {
-                        eng.postXfer(NIXL_WRITE, local, remote, init.localAgent, h);
-                        round_ok = checkComplete(eng, h);
-                    }
-                    eng.releaseReqH(h);
+                    bool round_ok = doXfer(eng, NIXL_WRITE, local, remote, agent);
                     std::memset(base, 0, sz);
-                    h = nullptr;
-                    if (round_ok &&
-                        eng.prepXfer(NIXL_READ, local, remote, init.localAgent, h) == NIXL_SUCCESS) {
-                        eng.postXfer(NIXL_READ, local, remote, init.localAgent, h);
-                        round_ok = checkComplete(eng, h);
-                    }
-                    eng.releaseReqH(h);
+                    if (round_ok) round_ok = doXfer(eng, NIXL_READ, local, remote, agent);
                     rc = (round_ok && std::memcmp(base, expect.data(), sz) == 0) ? 0 : 2;
                 }
                 eng.deregisterMem(key_md);
@@ -931,11 +683,11 @@ main(int argc, char **argv) {
         r.addDesc(nixlMetaDesc(0, good_len * 2, key_dev, k1_md));  // desc1: len mismatch
 
         nixlBackendReqH *h = nullptr;
-        nixl_status_t pp = eng.prepXfer(NIXL_WRITE, l, r, init.localAgent, h);
+        nixl_status_t pp = eng.prepXfer(NIXL_WRITE, l, r, agent, h);
         if (pp == NIXL_SUCCESS) {
             // A malformed list must not prepare a transfer. If it did, drive post
             // so we don't leak the handle, then fail.
-            eng.postXfer(NIXL_WRITE, l, r, init.localAgent, h);
+            eng.postXfer(NIXL_WRITE, l, r, agent, h);
             eng.releaseReqH(h);
             eng.deregisterMem(k1_md);
             eng.deregisterMem(k0_md);
