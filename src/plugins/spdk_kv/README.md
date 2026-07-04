@@ -15,275 +15,188 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# NIXL Generic SPDK NVMe-KV Plugin (`SPDK`)
+# NIXL SPDK NVMe Plugin (`SPDK`)
 
-A clean-sheet, **transport-agnostic** and **backend-agnostic** NIXL backend that
-speaks the **ratified NVMe Key-Value command set** over the SPDK NVMe driver
-(`lib/nvme`). It works against **any** SPDK NVMe-KV target — an in-memory
-`kvdev`, a librados-backed `kvdev`, a DPU-presented VF, an emulated NVMe in a
-guest — and is intended to be upstreamable to `ai-dynamo/nixl` as *the* generic
-SPDK KV backend.
+A NIXL backend that moves data between host DRAM and NVMe storage using SPDK's
+polled-mode NVMe driver (`lib/nvme`). One plugin serves two storage models,
+selected per engine:
 
-It carries **no backend-specific behavior, no KV Exec, and no long-key path** by
-design.
+- **Block (LBA)** — ordinary NVMe read/write against a block namespace.
+- **Key-Value** — the ratified NVMe Key-Value command set (Store / Retrieve /
+  Exist) against a KV namespace.
 
-This directory implements the **walking skeleton**, **Exist (QUERY) and value
-auto-sizing**, and **large values**.
+The plugin is **transport-agnostic**: the same datapath runs against a real local
+NVMe device (`trtype:PCIE`), a stock SPDK NVMe-oF target over vfio-user
+(`trtype:VFIOUSER`), or a DPU-presented function — chosen purely by a config
+string, with no code change. The backend registers with NIXL under the name
+`SPDK`.
 
-## Scope
+## Choosing a mode
 
-In:
-- NIXL `WRITE` → KV **Store**, NIXL `READ` → KV **Retrieve**.
-- NIXL `queryMem` / QUERY → KV **Exist** (cache hit/miss, **no data transfer**).
-- **Value auto-sizing** on Retrieve: a short host buffer surfaces the device's
-  **TRUE value length** (completion `cdw0`) so the caller can **resize and
-  re-Retrieve** instead of silently truncating.
-- **16-byte inline keys**, taken **verbatim** (opaque; no lineage parsing).
-- **Small AND large values** (up to ~64 MiB) in **host DRAM**, large ones
-  carried by a **region-bounded SGL** (see below). **No striping.**
-- Connect via a **standard SPDK transport ID** — either
-  `trtype:VFIOUSER traddr:<sock>` (an SPDK vfio-user target) or
-  `trtype:PCIE traddr:<BDF>` (a real NVMe controller via `vfio-pci`). The
-  transport is chosen **purely by the config string**, with **no code fork**.
+An engine binds **one** namespace kind, selected at construction by the `csi`
+parameter (aliases `ns_kind`, `mode`):
 
-Out:
-- VRAM / P2PDMA.
-- Delete/List, as needed.
-- KV **Exec** and **long keys** — permanently out of scope for this generic
-  plugin.
+| `csi` value | Mode | NIXL segments (local ↔ remote) |
+| --- | --- | --- |
+| `kv` *(default)* | Key-Value | `DRAM_SEG` ↔ `OBJ_SEG` |
+| `block` *(aliases `blk`, `nvm`)* | Block / LBA | `DRAM_SEG` ↔ `BLK_SEG` |
 
-## Operation and memory-type mapping
+`getSupportedMems()` reflects the bound mode — a KV engine advertises
+`{DRAM_SEG, OBJ_SEG}`, a block engine `{DRAM_SEG, BLK_SEG}` — and posting the
+wrong remote segment type to an engine is rejected with `NIXL_ERR_NOT_SUPPORTED`.
 
-| NIXL operation | Local mem  | Remote mem | NVMe KV command |
-| -------------- | ---------- | ---------- | --------------- |
-| `NIXL_WRITE`   | `DRAM_SEG` | `OBJ_SEG`  | KV **Store**    |
-| `NIXL_READ`    | `DRAM_SEG` | `OBJ_SEG`  | KV **Retrieve** |
-| `queryMem`     | —          | `OBJ_SEG`  | KV **Exist**    |
+## Block mode (`csi=block`)
 
-The remote `OBJ_SEG` descriptor carries the NIXL block identifier in its
-`metaInfo` blob. The engine takes those bytes **verbatim** as the inline NVMe-KV
-key (1–16 bytes). An empty or over-16-byte key is **rejected**
-(`NIXL_ERR_INVALID_PARAM`), never truncated (truncation would alias distinct
-keys sharing a prefix and corrupt data).
+| NIXL op | Local | Remote | Effect |
+| --- | --- | --- | --- |
+| `NIXL_WRITE` | `DRAM_SEG` | `BLK_SEG` | Write DRAM → device LBAs |
+| `NIXL_READ`  | `DRAM_SEG` | `BLK_SEG` | Read device LBAs → DRAM |
 
-`queryMem` returns per the OBJ/file convention: `resp[i]` **engaged** (an empty
-params map) on a **hit**, `std::nullopt` on a **miss**. A submit-/transport-level
-failure returns an error status (never masked as a miss).
+The remote `BLK_SEG` descriptor's **address is the starting LBA**, and the
+transfer length (bytes) must be a **multiple of the namespace sector size**. A
+range that is mis-sized, past the single-op limit (see [Transfer
+size](#transfer-size)), or beyond namespace capacity is rejected
+(`NIXL_ERR_INVALID_PARAM`) before any DMA. `queryMem` is not defined for block.
+Namespaces formatted with per-LBA metadata (interleaved / extended-LBA / DIF/DIX)
+are refused when the engine opens.
 
-## Design decisions
+## Key-Value mode (`csi=kv`)
 
-- **Build on SPDK `lib/nvme`, not the raw vfio-user client.** The
-  plugin submits KV commands through SPDK's public NVMe-KV API
-  (`spdk_nvme_kv_store` / `spdk_nvme_kv_retrieve` in `include/spdk/nvme_kv.h`)
-  over a controller attached with `spdk_nvme_probe`. SPDK's transport layer is
-  what makes the datapath transport-agnostic for free (VFIOUSER now, PCIE
-  later). This is why the plugin does **not** carry a bespoke raw vfio-user client.
-- **Own generic shim.** The C++ backend talks to a small, self-contained C shim
-  (`spdk_kv_shim.{h,c}`) compiled into its own static lib. This isolates the
-  C-only SPDK headers from the C++ TUs and keeps the plugin free of any external
-  shim dependency. The shim is generic (no backend-specific behavior). It
-  intentionally does **not** carry per-op identity-token / reconnect hardening;
-  that robustness (for target-death mid-op) is deferred — this skeleton targets
-  a healthy in-memory/vfio-user target.
-- **Transport as config.** The `transport_id` param is a standard SPDK transport
-  ID string parsed with `spdk_nvme_transport_id_parse`. A bare socket directory
-  may be passed as `vfu_addr`/`socket` and is wrapped into a VFIOUSER trid.
-- **Key is opaque.** Lineage-vs-flat is the caller's key-format choice; the
-  generic plugin only checks the bytes fit the ratified 1–16-byte window.
-- **Zero-copy DRAM, with a staging fallback.** Store/Retrieve/read/write DMA
-  to/from the value buffer, so it must be DMA-reachable by the transport.
-  `registerMem()` makes the caller's DRAM reachable (`spdk_kv_shim_mem_register`)
-  and the datapath then DMAs **straight into the caller's buffer — no copy**
-  (Store/write from it, Retrieve/read into it). **Reachability is
-  transport-specific:** a **vfio-user** target maps client memory *by fd*, so
-  only fd-backed memory (SPDK-DMA / hugepage / memfd, or a dma-buf) is directly
-  usable there — plain anonymous DRAM is not (a subtlety: `spdk_mem_register()`
-  accepts it yet silently fails to map it to the target, so the plugin verifies
-  real reachability and rolls back a registration that did not take); a
-  **PCIE/IOMMU** controller can reach any 4 KiB-aligned, vtophys-translatable
-  DRAM, which the plugin registers (IOMMU-mapping and pinning it). For an
-  unreachable region the plugin **falls
-  back** to staging through a per-request SPDK DMA buffer and copying — always
-  correct, just a copy. Both paths describe the buffer to the device with the
-  same region-bounded SGL, so large values are zero-copy too.
-  `nixlSpdkKvEngine::dramIsDmaRegistered()` reports which path a region took.
-  Registering a GPU/VRAM dma-buf directly (P2PDMA) extends this same hook.
-- **Value auto-sizing.** On Retrieve the completion `cdw0` carries the device's
-  TRUE stored length. Devices signal a short host buffer two ways — SUCCESS with
-  `cdw0 > buf_len` (this KV target), or `0x85 INVALID_VALUE_SIZE` directly — and
-  the shim **normalizes both** to a single `BUFFER_TOO_SMALL` (`0x85`) return
-  that reports the true length. The backend then does **not** copy a truncated
-  value; it records the true length and reports `NIXL_ERR_MISMATCH`, so the
-  caller resizes and re-Retrieves. The true length is read back with
-  `getReqTrueLen(handle, idx)`. This implements the **optimistic-then-resize**
-  strategy; a size-cache and a 2-RTT probe-first variant are left for later.
+| NIXL op | Local | Remote | Effect |
+| --- | --- | --- | --- |
+| `NIXL_WRITE` | `DRAM_SEG` | `OBJ_SEG` | KV **Store** |
+| `NIXL_READ`  | `DRAM_SEG` | `OBJ_SEG` | KV **Retrieve** |
+| `queryMem`   | — | `OBJ_SEG` | KV **Exist** (hit/miss, no data transfer) |
 
-## Large values — region-bounded SGL, and why we do NOT stripe
+The remote `OBJ_SEG` descriptor's `metaInfo` blob **is the inline KV key**, taken
+verbatim — 1 to 16 bytes, opaque (the plugin does not parse or interpret it). An
+empty or over-16-byte key is rejected, never truncated. `queryMem` reports a hit
+as an engaged `resp[i]` (empty params map) and a miss as `std::nullopt`; a
+transport error is surfaced as an error, not masked as a miss.
 
-A value up to **~64 MiB** rides a **single KV op** described by a **region-bounded
-scatter-gather list**: one standard NVMe data-block descriptor per **2 MiB DMA
-region** (no vendor extension). The shim hands `lib/nvme` one 2 MiB-bounded
-segment at a time via the SGL iterator (`spdk_nvme_ctrlr_cmd_iov_raw_with_md`)
-and **disables the PCIe SGL merge** so each segment becomes its own descriptor —
-the vfio-user target maps each 2 MiB region independently, so a single descriptor
-must **not** cross a region boundary. The descriptor count is bounded by the target's
-`NVMF_REQ_MAX_BUFFERS` (`SPDK_NVMF_MAX_SGL_ENTRIES*2+1 = 33`), which caps a
-single op at ~64 MiB (32 full 2 MiB regions plus a partial first region). This
-iovec budget — not the transport's `max_io_size` (128 KiB by default) — is the
-real single-op ceiling.
+**A short Retrieve buffer doesn't truncate.** If the stored value is larger than
+the buffer you provide, Retrieve returns `NIXL_ERR_MISMATCH` and records the
+value's true length — read it with `getReqTrueLen(handle, idx)`, then resize and
+re-Retrieve.
 
-**No striping — a hard design decision.** A value that would need more than the
-region budget is **rejected** (`NIXL_ERR_INVALID_PARAM`, before any DMA is
-staged), never split across ops. This is sound because a **KV-cache block's byte
-size is bounded and computable from model attributes**:
+## Transfer size
 
-```
-block_bytes = 2 (K,V) x n_layers x n_kv_heads x head_dim x dtype_bytes x tokens_per_block
-```
+A single transfer — a KV value or a block range — moves in **one NVMe op** up to
+**~64 MiB**, described by a region-bounded scatter-gather list (one descriptor
+per 2 MiB DMA region, up to 33 regions). A transfer larger than that is
+**rejected, never silently split** — size your transfers to fit one op. This
+suits KV-cache blocks well: a block's byte size is fixed by the model's
+attributes and lands in the low-MiB range. On a real PCIE controller the bound is
+additionally clamped to the device's MDTS.
 
-For real models this lands in the low-MiB range (e.g. Llama-3-8B — GQA 8 KV
-heads, head_dim 128, fp16, 16-token block ≈ 2 MiB), comfortably inside the
-single-op SGL bound. So **one value = one op**: the caller sizes its blocks
-(`tokens_per_block`) so a block fits one op, and a value that genuinely exceeds
-the bound is out of scope for the KV-cache use case rather than something to
-chunk. The single-op bound is `SPDK_KV_SHIM_MAX_VALUE_LEN` (64 MiB), further
-clamped to the namespace-advertised `kvvml` when smaller.
+## Zero-copy vs staging
 
-Note: the region-crossing protection is **load-bearing only for hugepage-backed
-DMA** (production), where each 2 MiB region is a separately-registered hugepage.
-The `--no-huge` test harness backs DMA with a single region, so the byte-exact
-large-value tests prove the SGL/iterator datapath end-to-end; the per-region
-descriptor split is built by construction and exercised there, but its
-*necessity* only manifests under hugepages.
+The datapath DMAs **directly to and from your buffer** — no bounce copy — when
+that buffer is DMA-reachable by the transport. Register it with `registerMem()`
+first. What counts as reachable depends on the transport:
 
-## Custom backend parameters (`nixl_b_params_t`)
+- **vfio-user** targets map client memory by file descriptor, so only fd-backed
+  memory is zero-copy: SPDK-DMA (`spdk_dma_malloc`), hugepages, memfd, or a
+  dma-buf. Plain anonymous DRAM is not.
+- **PCIE / IOMMU** controllers can reach any page-aligned, IOMMU-mappable DRAM.
 
-| Parameter      | Required | Default | Meaning |
-| -------------- | -------- | ------- | ------- |
-| `transport_id` | yes\*    | —       | SPDK transport ID, e.g. `trtype:VFIOUSER traddr:<socket-dir>`. |
-| `vfu_addr`     | yes\*    | —       | Bare vfio-user socket dir; wrapped into a VFIOUSER `transport_id`. Aliases: `socket`, `vfio_user_path`. |
-| `nsid`         | no       | `0`     | NVMe namespace id; `0`/unset auto-selects the first KV namespace. |
-| `init_env`     | no       | `false` | `false`: the host/agent owns the SPDK env (multiple engines per process). `true`: the shim brings up its own no-hugepage SPDK env (single instance; for standalone tests). |
+A buffer that cannot be made reachable still works — the plugin transparently
+**stages** it through an SPDK-DMA buffer and copies (correct, just not zero-copy).
+`dramIsDmaRegistered()` reports which path a registration took.
+
+## Parameters (`nixl_b_params_t`)
+
+| Parameter | Required | Default | Meaning |
+| --- | --- | --- | --- |
+| `transport_id` | yes\* | — | SPDK transport ID, e.g. `trtype:VFIOUSER traddr:<socket-dir>` or `trtype:PCIE traddr:<BDF>`. |
+| `vfu_addr` | yes\* | — | Bare vfio-user socket dir; wrapped into a VFIOUSER `transport_id`. Aliases: `socket`, `vfio_user_path`. |
+| `csi` | no | `kv` | Namespace kind: `kv` or `block` (aliases `blk`, `nvm`). This key also accepts the names `ns_kind` and `mode`. |
+| `nsid` | no | `0` | NVMe namespace id; `0`/unset auto-selects the first namespace of the chosen kind. |
+| `init_env` | no | `false` | `false`: the host/agent owns the SPDK env (many engines per process). `true`: the engine brings up its own no-hugepage SPDK env (single instance; for standalone tests). |
 
 \* Provide **either** `transport_id` **or** `vfu_addr`.
 
 ## Build
 
-The plugin is gated on the prebuilt SPDK NVMe library and the KV header; it is
-skipped automatically if they are absent. It ships its own shim.
+The plugin links against a prebuilt SPDK tree and is skipped automatically if the
+SPDK NVMe library (and, for KV, the `spdk/nvme_kv.h` header) is absent.
 
 ```bash
-meson setup builddir \
-    -Denable_plugins=SPDK \
-    -Dspdk_root=/path/to/spdk \
-    -Dspdk_kv_build_test=true
-ninja -C builddir src/plugins/spdk_kv/libplugin_SPDK.so \
-                  src/plugins/spdk_kv/spdk_kv_roundtrip_test
+meson setup builddir -Denable_plugins=SPDK -Dspdk_root=/path/to/spdk
+ninja -C builddir src/plugins/spdk_kv/libplugin_SPDK.so
 ```
 
-| Option              | Default | Description |
-| ------------------- | ------- | ----------- |
-| `spdk_root`         | `""`    | Path to the built SPDK tree to link against (unset — required). |
-| `spdk_kv_build_test`| `false` | Build the direct-engine round-trip test binary. |
+| Option | Default | Description |
+| --- | --- | --- |
+| `spdk_root` | `""` | Path to the built SPDK tree to link against (required). |
+| `spdk_kv_build_test` | `false` | Also build the round-trip test binaries. |
 
 ## Testing
 
-`run_roundtrip.sh` stands up an SPDK `nvmf_tgt` with an **in-memory** KV
-namespace (`kvdev_mem`, **no Ceph**) over VFIOUSER and runs the round-trip test:
-Store a value under a 16-byte key, Retrieve it back, and verify byte-for-byte.
-It covers a small value, the opaque key guards, **QUERY/Exist** (hit on a stored
-key, miss on an absent key), **value auto-sizing** (a short-buffer READ reports
-the true length, then a correctly-sized READ returns byte-exact), **large
-values** at **1 MiB (1 region), 8 MiB (4 regions), and 60 MiB (30 regions)**, a
-**large-value auto-sizing** case (a too-small READ of a multi-region value
-reports the true length, then a resized re-Retrieve is byte-exact), and a **68
-MiB oversize value that must be cleanly rejected, not split**. The script raises
-the `kvdev_mem` `--max-value-len` so the target accepts the large stores (the
-host-side ~64 MiB region-bounded-SGL bound remains the effective limit).
-
-Note: the round-trip needs a **target-capable** KV SPDK build (one whose
-`nvmf_tgt` has the `kvdev_mem` module + KV nvmf namespace RPCs). Point
-`SPDK_ROOT` at that tree; the host-side SPDK the plugin links against may carry
-only the NVMe-KV *host* driver.
+Each harness stands up a local SPDK `nvmf_tgt` over vfio-user and runs a
+byte-exact round-trip against it. Point `SPDK_ROOT` at a **target-capable** SPDK
+build (one whose `nvmf_tgt` has the namespace RPCs the harness needs); the
+host-side SPDK the plugin links against may carry only the driver. Build the test
+binaries with `-Dspdk_kv_build_test=true`.
 
 ```bash
+# Key-Value: store/retrieve under 16-byte keys, Exist hit/miss, value
+# auto-sizing, and large values (1 / 8 / 60 MiB) with an oversize value rejected.
 SPDK_ROOT=/path/to/spdk ./run_roundtrip.sh
-```
 
-`run_block_roundtrip.sh` stands up an `nvmf_tgt` with an **NVM (block)**
-namespace backed by a `malloc` bdev over VFIOUSER and runs the **block**
-round-trip test (`spdk_kv_block_roundtrip_test`): write DRAM patterns to LBA
-ranges (4 KiB…~60 MiB), read them back byte-exact, and confirm the misaligned,
-over-single-op-bound, and out-of-capacity guards reject cleanly.
-
-```bash
+# Block: DRAM <-> LBA read/write (4 KiB .. ~60 MiB), with misaligned,
+# over-single-op, and out-of-capacity ranges rejected cleanly.
 SPDK_ROOT=/path/to/spdk ./run_block_roundtrip.sh
-```
 
-`run_block_metadata_reject.sh` is the negative counterpart: it stands up a
-**metadata-formatted** (interleaved / extended-LBA) `malloc` bdev as a block
-namespace and asserts the engine **refuses it cleanly at init** (a distinct
-`-ENOTSUP`), rather than faulting later at SGL build. The block datapath sizes
-transfers from the **data-only** sector size, so a namespace carrying per-LBA
-metadata (whose payload lib/nvme sizes from the larger *extended* sector size) is
-rejected at open. If the target SPDK build cannot create a metadata malloc bdev,
-the script reports `SKIP` (the guard is not exercised there).
-
-```bash
+# Block (negative): a metadata-formatted namespace is refused at engine open.
 SPDK_ROOT=/path/to/spdk ./run_block_metadata_reject.sh
 ```
 
-### Device-mode (`PCIE`) testing
+### Device mode — real NVMe over PCIE
 
-The block datapath is transport-agnostic, so the **same** block round-trip runs
-against a **real local NVMe controller** over the `PCIE` transport — selected
-purely by the transport-ID string (`trtype:PCIE traddr:<BDF>`), **no code fork**.
-`run_block_pcie.sh` is the device-mode harness:
+Because the transport is just a config string, the **same** block round-trip runs
+against a **real local NVMe controller** on `vfio-pci`, selected with
+`trtype:PCIE traddr:<BDF>`. `run_block_pcie.sh` is the device-mode harness:
 
 ```bash
 PCI_BDF=0000:xx:00.0 BIND=1 ./run_block_pcie.sh
 ```
 
-> **DESTRUCTIVE — scratch device only.** This **WRITES LBAs (including LBA 0)**
-> on the device at `PCI_BDF`, overwriting any partition table / filesystem /
-> data. Point `PCI_BDF` at a **dedicated scratch** NVMe device or namespace
-> **only**; never a device holding data.
+> **DESTRUCTIVE — scratch device only.** This **writes LBAs (including LBA 0)** on
+> the device at `PCI_BDF`, overwriting any partition table / filesystem / data.
+> Point `PCI_BDF` at a **dedicated scratch** NVMe device or namespace **only**,
+> never one holding data.
 
 The runner **fails safe** — before any bind or write it validates `PCI_BDF` and
-**refuses** (non-zero exit, nothing touched) unless the target is a safe scratch
-NVMe:
+refuses (non-zero exit, nothing touched) unless the target is a safe scratch NVMe:
 
-- the PCI device must **exist** and be an **NVMe controller** (class `0x0108xx`);
-- any of its kernel block namespaces (or partitions) that is **mounted** or holds
-  the **root filesystem** is refused **unconditionally** (`FORCE` cannot override);
+- the PCI device must exist and be an **NVMe controller** (class `0x0108xx`);
+- any of its namespaces (or partitions) that is **mounted** or holds the **root
+  filesystem** is refused unconditionally (`FORCE` cannot override);
 - a namespace carrying a recognized **filesystem/partition signature** is refused
-  **unless `FORCE=1`** — a truly blank scratch device passes without `FORCE`; a
-  device you *intend* to overwrite needs `FORCE=1`. (This also covers a whole-disk
-  filesystem with no partition table.)
+  unless `FORCE=1` — a blank scratch device passes without `FORCE`.
 
-It also requires an explicit `PCI_BDF` (never guesses), makes you type the BDF
-back to confirm (skip with `ASSUME_YES=1` for non-interactive runs), and after a
-`BIND=1` bind **asserts** the target actually landed on `vfio-pci` before writing.
-
-To deliberately overwrite a device that has an existing signature:
-
-```bash
-PCI_BDF=0000:xx:00.0 BIND=1 FORCE=1 ./run_block_pcie.sh
-```
+It requires an explicit `PCI_BDF` (never guesses), asks you to type the BDF back
+to confirm (`ASSUME_YES=1` skips this for non-interactive runs), and after a
+`BIND=1` bind asserts the target actually landed on `vfio-pci` before writing.
 
 Host requirements:
 
-- **IOMMU enabled** (`intel_iommu=on`, or `amd_iommu=on iommu=pt`). The shim's
-  SPDK env uses `no_huge` (DPDK IOVA=VA), so a `vfio-pci`-bound controller can
-  only DMA through an IOMMU. Check `/sys/kernel/iommu_groups/` is non-empty.
-- The scratch controller **bound to `vfio-pci`**. `BIND=1` binds it for you,
-  scoped to just that BDF via `PCI_ALLOWED` (SPDK `scripts/setup.sh`), so no
-  other NVMe controller — e.g. your boot drive — is touched. The vars are passed
-  through `sudo env` so a hardened sudoers (`env_reset`) cannot strip
-  `PCI_ALLOWED` and turn the scoped bind into a bind-everything. Equivalent
-  manual bind:
+- **IOMMU enabled** (`intel_iommu=on`, or `amd_iommu=on iommu=pt`). The SPDK env
+  runs `no_huge` (DPDK IOVA=VA), so a `vfio-pci`-bound controller can only DMA
+  through an IOMMU. Check `/sys/kernel/iommu_groups/` is non-empty.
+- The scratch controller **bound to `vfio-pci`**. `BIND=1` does this for you,
+  scoped to just that BDF via `PCI_ALLOWED` so no other NVMe controller (e.g. your
+  boot drive) is touched. Equivalent manual bind:
   ```bash
   sudo env PCI_ALLOWED="$PCI_BDF" HUGEMEM=64 /path/to/spdk/scripts/setup.sh
   # hand it back to the kernel afterwards:
   sudo env PCI_ALLOWED="$PCI_BDF" /path/to/spdk/scripts/setup.sh reset
   ```
+
+## Scope
+
+This backend is intentionally generic: it carries **no** backend-specific
+behavior, KV Exec, long-key path, or VRAM/P2PDMA. Direct-to-VRAM transfers
+(P2PDMA into a GPU dma-buf) are a planned follow-up that extends the same
+registration hook.
