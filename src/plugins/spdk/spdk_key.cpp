@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "spdk_kv_key.h"
+#include "spdk_key.h"
 
 #include <algorithm>
 

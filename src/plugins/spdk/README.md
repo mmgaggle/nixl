@@ -123,13 +123,13 @@ SPDK NVMe library (and, for KV, the `spdk/nvme_kv.h` header) is absent.
 
 ```bash
 meson setup builddir -Denable_plugins=SPDK -Dspdk_root=/path/to/spdk
-ninja -C builddir src/plugins/spdk_kv/libplugin_SPDK.so
+ninja -C builddir src/plugins/spdk/libplugin_SPDK.so
 ```
 
 | Option | Default | Description |
 | --- | --- | --- |
 | `spdk_root` | `""` | Path to the built SPDK tree to link against (required). |
-| `spdk_kv_build_test` | `false` | Also build the round-trip test binaries. |
+| `spdk_build_test` | `false` | Also build the round-trip test binaries. |
 
 ## Testing
 
@@ -137,7 +137,7 @@ Each harness stands up a local SPDK `nvmf_tgt` over vfio-user and runs a
 byte-exact round-trip against it. Point `SPDK_ROOT` at a **target-capable** SPDK
 build (one whose `nvmf_tgt` has the namespace RPCs the harness needs); the
 host-side SPDK the plugin links against may carry only the driver. Build the test
-binaries with `-Dspdk_kv_build_test=true`.
+binaries with `-Dspdk_build_test=true`.
 
 ```bash
 # Key-Value: store/retrieve under 16-byte keys, Exist hit/miss, value

@@ -33,8 +33,8 @@
 #include "spdk/nvme_spec.h"
 #include "spdk/util.h"	/* spdk_divide_round_up(), SPDK_ALIGN_FLOOR() */
 
-#include "spdk_kv_shim.h"
-#include "spdk_kv_fence.h"
+#include "spdk_shim.h"
+#include "spdk_fence.h"
 
 /*
  * Per-op completion budget. Bounds how long an in-flight KV command may run
@@ -43,9 +43,9 @@
  * sub-millisecond; 20s is generous headroom for a slow round-trip while still
  * bounding a dead target to seconds.
  */
-#define SPDK_KV_SHIM_OP_TIMEOUT_S 20u
+#define SPDK_SHIM_OP_TIMEOUT_S 20u
 
-struct spdk_kv_shim {
+struct spdk_shim {
 	struct spdk_nvme_ctrlr	*ctrlr;
 	struct spdk_nvme_ns	*ns;
 	/* Cached namespace id (spdk_nvme_ns_get_id(ns)); bound once at open. */
@@ -61,14 +61,14 @@ struct spdk_kv_shim {
 	uint64_t		num_sectors;	/* namespace capacity (sectors) */
 	/*
 	 * Largest single-op KV-raw value transfer in bytes, computed once at open.
-	 * Starts at the region-budget bound (SPDK_KV_SHIM_MAX_VALUE_LEN) and, on a
+	 * Starts at the region-budget bound (SPDK_SHIM_MAX_VALUE_LEN) and, on a
 	 * PCIE controller, is clamped to the device's MDTS-derived max transfer
 	 * size: the KV-raw path (spdk_nvme_ctrlr_cmd_iov_raw_with_md) bypasses
 	 * lib/nvme's MDTS splitting, so a real controller with a small MDTS must be
 	 * honored here rather than rejecting each oversized op. Left at the full
 	 * region budget on VFIOUSER, where the transport's 128 KiB max-xfer constant
 	 * is advisory and does not describe the raw region-bounded SGL path. Feeds
-	 * spdk_kv_shim_max_value_len_op(); the block path uses readv/writev (which
+	 * spdk_shim_max_value_len_op(); the block path uses readv/writev (which
 	 * lib/nvme splits at MDTS) and is deliberately not clamped.
 	 */
 	uint32_t		max_xfer_op;
@@ -81,7 +81,7 @@ struct spdk_kv_shim {
 	 * a time. The completion callback records into the fence's slot and the
 	 * submitting op reads it back after the poll.
 	 *
-	 * Timeout / transport-failure hardening (see spdk_kv_fence.h): if an op
+	 * Timeout / transport-failure hardening (see spdk_fence.h): if an op
 	 * times out or the qpair transport-fails, the outstanding hardware tracker
 	 * is NOT aborted (vfio-user does not abort trackers on disconnect), so a
 	 * late "orphan" completion could otherwise fire later and be mis-recorded,
@@ -90,12 +90,12 @@ struct spdk_kv_shim {
 	 * checks (stale orphans are discarded), a timeout/-ENXIO latches the fence
 	 * POISONED so no later op is submitted under the live tracker, and the
 	 * staging buffer of a poisoned op is quarantined rather than freed until
-	 * the fencing teardown in spdk_kv_shim_close() proves the tracker dead.
+	 * the fencing teardown in spdk_shim_close() proves the tracker dead.
 	 * op_tag is this shim's single per-op completion cb_arg (safe to embed and
 	 * reuse precisely because a poisoned fence refuses any reuse-while-live).
 	 */
-	struct spdk_kv_fence	fence;
-	struct spdk_kv_op_tag	op_tag;
+	struct spdk_fence	fence;
+	struct spdk_op_tag	op_tag;
 	/*
 	 * Region-bounded SGL iterator state for the in-flight op. lib/nvme drives
 	 * kv_reset_sgl()/kv_next_sge() (below) with this shim as the callback arg to
@@ -118,7 +118,7 @@ static void
 attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	  struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_ctrlr_opts *opts)
 {
-	struct spdk_kv_shim *sh = cb_ctx;
+	struct spdk_shim *sh = cb_ctx;
 
 	sh->ctrlr = ctrlr;
 }
@@ -132,7 +132,7 @@ io_complete(void *arg, const struct spdk_nvme_cpl *cpl)
 	 * poller is waiting for, so a late orphan from a timed-out op cannot be
 	 * mis-recorded as the current op's status.
 	 */
-	spdk_kv_fence_complete(arg, cpl->status.sct, cpl->status.sc, cpl->cdw0);
+	spdk_fence_complete(arg, cpl->status.sct, cpl->status.sc, cpl->cdw0);
 }
 
 /*
@@ -145,20 +145,20 @@ io_complete(void *arg, const struct spdk_nvme_cpl *cpl)
  * staging buffer is freed) under that live tracker until a fencing teardown.
  */
 static int
-poll_to_completion(struct spdk_kv_shim *sh)
+poll_to_completion(struct spdk_shim *sh)
 {
 	uint64_t deadline = spdk_get_ticks() +
-			    (uint64_t)SPDK_KV_SHIM_OP_TIMEOUT_S * spdk_get_ticks_hz();
+			    (uint64_t)SPDK_SHIM_OP_TIMEOUT_S * spdk_get_ticks_hz();
 
-	while (!spdk_kv_fence_done(&sh->fence)) {
+	while (!spdk_fence_done(&sh->fence)) {
 		int32_t n = spdk_nvme_qpair_process_completions(sh->qpair, 0);
 
 		if (n < 0) {
-			spdk_kv_fence_poison(&sh->fence);
+			spdk_fence_poison(&sh->fence);
 			return n;
 		}
-		if (!spdk_kv_fence_done(&sh->fence) && spdk_get_ticks() >= deadline) {
-			spdk_kv_fence_poison(&sh->fence);
+		if (!spdk_fence_done(&sh->fence) && spdk_get_ticks() >= deadline) {
+			spdk_fence_poison(&sh->fence);
 			return -ETIMEDOUT;
 		}
 	}
@@ -172,7 +172,7 @@ poll_to_completion(struct spdk_kv_shim *sh)
  *   negative -> transport/other error (negated errno)
  */
 static int
-status_to_rc(struct spdk_kv_shim *sh)
+status_to_rc(struct spdk_shim *sh)
 {
 	if (sh->fence.op_sct != SPDK_NVME_SCT_GENERIC) {
 		return -EIO;
@@ -181,9 +181,9 @@ status_to_rc(struct spdk_kv_shim *sh)
 }
 
 int
-spdk_kv_shim_open(const struct spdk_kv_shim_opts *opts, struct spdk_kv_shim **out)
+spdk_shim_open(const struct spdk_shim_opts *opts, struct spdk_shim **out)
 {
-	struct spdk_kv_shim *sh;
+	struct spdk_shim *sh;
 	struct spdk_nvme_transport_id trid = {};
 	const struct spdk_nvme_kv_ns_data *kv_ns_data;
 	enum spdk_nvme_csi want_csi;
@@ -196,7 +196,7 @@ spdk_kv_shim_open(const struct spdk_kv_shim_opts *opts, struct spdk_kv_shim **ou
 	/* Define the out-param up front so every failure path leaves the
 	 * caller's handle defined rather than stale. */
 	*out = NULL;
-	if (opts->opts_size < sizeof(struct spdk_kv_shim_opts)) {
+	if (opts->opts_size < sizeof(struct spdk_shim_opts)) {
 		return -EINVAL;
 	}
 	if (opts->transport_id == NULL) {
@@ -207,14 +207,14 @@ spdk_kv_shim_open(const struct spdk_kv_shim_opts *opts, struct spdk_kv_shim **ou
 	if (sh == NULL) {
 		return -ENOMEM;
 	}
-	spdk_kv_fence_init(&sh->fence);
+	spdk_fence_init(&sh->fence);
 
 	if (opts->init_env) {
 		struct spdk_env_opts env_opts;
 
 		env_opts.opts_size = sizeof(env_opts);
 		spdk_env_opts_init(&env_opts);
-		env_opts.name = opts->name ? opts->name : "spdk_kv_shim";
+		env_opts.name = opts->name ? opts->name : "spdk_shim";
 		/* As an in-process host we may run unprivileged without reserved
 		 * hugepages. no_huge selects IOVA=VA so DMA works without
 		 * root/PA access; mem_size bounds the no-huge heap. */
@@ -248,7 +248,7 @@ spdk_kv_shim_open(const struct spdk_kv_shim_opts *opts, struct spdk_kv_shim **ou
 	 * still selects the op per transfer; ns_kind only scopes which namespace
 	 * this shim binds.
 	 */
-	sh->is_block = (opts->ns_kind == SPDK_KV_SHIM_NS_KIND_BLOCK);
+	sh->is_block = (opts->ns_kind == SPDK_SHIM_NS_KIND_BLOCK);
 	want_csi = sh->is_block ? SPDK_NVME_CSI_NVM : SPDK_NVME_CSI_KV;
 
 	/* Bind the requested namespace, or the first ns of the wanted CSI when nsid==0. */
@@ -353,7 +353,7 @@ spdk_kv_shim_open(const struct spdk_kv_shim_opts *opts, struct spdk_kv_shim **ou
 
 	/*
 	 * Fix the single-op KV-raw transfer ceiling once, here at open. The
-	 * region-budget bound (SPDK_KV_SHIM_MAX_VALUE_LEN) is the structural ceiling
+	 * region-budget bound (SPDK_SHIM_MAX_VALUE_LEN) is the structural ceiling
 	 * (one data-block descriptor per 2 MiB region, NVMF_REQ_MAX_BUFFERS = 33).
 	 * The KV-raw datapath (spdk_nvme_ctrlr_cmd_iov_raw_with_md) BYPASSES
 	 * lib/nvme's MDTS splitting, so on a PCIE controller -- where max_xfer_size
@@ -363,9 +363,9 @@ spdk_kv_shim_open(const struct spdk_kv_shim_opts *opts, struct spdk_kv_shim **ou
 	 * hardcodes a 128 KiB max_xfer_size that is advisory (the target does not
 	 * enforce it on the direct-map raw SGL path), so the full region-budget
 	 * bound is kept there. The block path is unaffected: readv/writev let
-	 * lib/nvme split at MDTS (see spdk_kv_shim_max_block_len_op).
+	 * lib/nvme split at MDTS (see spdk_shim_max_block_len_op).
 	 */
-	sh->max_xfer_op = SPDK_KV_SHIM_MAX_VALUE_LEN;
+	sh->max_xfer_op = SPDK_SHIM_MAX_VALUE_LEN;
 	if (trid.trtype == SPDK_NVME_TRANSPORT_PCIE) {
 		uint32_t mdts_xfer = spdk_nvme_ctrlr_get_max_xfer_size(sh->ctrlr);
 
@@ -390,7 +390,7 @@ err_env:
 }
 
 void
-spdk_kv_shim_close(struct spdk_kv_shim *sh)
+spdk_shim_close(struct spdk_shim *sh)
 {
 	if (sh == NULL) {
 		return;
@@ -408,7 +408,7 @@ spdk_kv_shim_close(struct spdk_kv_shim *sh)
 	 * on a timed-out / transport-failed op can no longer be DMA'd into, so free
 	 * them now (each exactly once) and clear the poison latch.
 	 */
-	spdk_kv_fence_drain(&sh->fence, spdk_dma_free);
+	spdk_fence_drain(&sh->fence, spdk_dma_free);
 	if (sh->ctrlr != NULL) {
 		spdk_nvme_detach(sh->ctrlr);
 	}
@@ -419,13 +419,13 @@ spdk_kv_shim_close(struct spdk_kv_shim *sh)
 }
 
 void *
-spdk_kv_shim_dma_alloc(size_t len)
+spdk_shim_dma_alloc(size_t len)
 {
 	return spdk_dma_zmalloc(len, 0, NULL);
 }
 
 void *
-spdk_kv_shim_dma_alloc_aligned(size_t len, size_t align)
+spdk_shim_dma_alloc_aligned(size_t len, size_t align)
 {
 	return spdk_dma_zmalloc(len, align, NULL);
 }
@@ -441,39 +441,39 @@ spdk_kv_shim_dma_alloc_aligned(size_t len, size_t align)
  * overhead. Same free/release rules as the zeroing variants.
  */
 void *
-spdk_kv_shim_dma_alloc_raw(size_t len)
+spdk_shim_dma_alloc_raw(size_t len)
 {
 	return spdk_dma_malloc(len, 0, NULL);
 }
 
 void *
-spdk_kv_shim_dma_alloc_raw_aligned(size_t len, size_t align)
+spdk_shim_dma_alloc_raw_aligned(size_t len, size_t align)
 {
 	return spdk_dma_malloc(len, align, NULL);
 }
 
 void
-spdk_kv_shim_dma_free(void *buf)
+spdk_shim_dma_free(void *buf)
 {
 	spdk_dma_free(buf);
 }
 
 bool
-spdk_kv_shim_poisoned(const struct spdk_kv_shim *sh)
+spdk_shim_poisoned(const struct spdk_shim *sh)
 {
 	/*
 	 * Expose the fence's poison latch so a caller that CACHES a staging buffer
 	 * for reuse can tell, after an op, whether that buffer may still be a live
 	 * DMA target (the op timed out / transport-failed). If so the caller must
-	 * route it through spdk_kv_shim_release_io_buf() -- which quarantines it --
+	 * route it through spdk_shim_release_io_buf() -- which quarantines it --
 	 * and drop it from its reuse cache; a quarantined buffer must never be
 	 * recycled. NULL-safe.
 	 */
-	return sh != NULL && spdk_kv_fence_poisoned(&sh->fence);
+	return sh != NULL && spdk_fence_poisoned(&sh->fence);
 }
 
 void
-spdk_kv_shim_release_io_buf(struct spdk_kv_shim *sh, void *buf)
+spdk_shim_release_io_buf(struct spdk_shim *sh, void *buf)
 {
 	if (buf == NULL) {
 		return;
@@ -484,12 +484,12 @@ spdk_kv_shim_release_io_buf(struct spdk_kv_shim *sh, void *buf)
 	 * would return still-DMA-mapped memory to the heap, which a recovered target
 	 * could DMA into (a use-after-free that silently corrupts client memory).
 	 * Quarantine it instead; it is freed at the fencing teardown in
-	 * spdk_kv_shim_close(). If the quarantine node cannot be allocated the
+	 * spdk_shim_close(). If the quarantine node cannot be allocated the
 	 * buffer is intentionally leaked -- a bounded leak under post-failure memory
 	 * pressure is strictly safer than a use-after-free.
 	 */
-	if (sh != NULL && spdk_kv_fence_poisoned(&sh->fence)) {
-		(void)spdk_kv_fence_quarantine(&sh->fence, buf);
+	if (sh != NULL && spdk_fence_poisoned(&sh->fence)) {
+		(void)spdk_fence_quarantine(&sh->fence, buf);
 		return;
 	}
 	spdk_dma_free(buf);
@@ -517,7 +517,7 @@ spdk_kv_shim_release_io_buf(struct spdk_kv_shim *sh, void *buf)
  *     out-param; advance by it and re-probe until the whole span is covered.
  */
 static bool
-kv_mem_reachable(const struct spdk_kv_shim *sh, const void *vaddr, size_t len)
+kv_mem_reachable(const struct spdk_shim *sh, const void *vaddr, size_t len)
 {
 	const struct spdk_nvme_transport_id *trid;
 	uintptr_t start, end, probe;
@@ -543,8 +543,8 @@ kv_mem_reachable(const struct spdk_kv_shim *sh, const void *vaddr, size_t len)
 		 * not a single consistent fd across the span.
 		 */
 		for (probe = start; probe < end;
-		     probe = SPDK_ALIGN_FLOOR(probe, SPDK_KV_SHIM_DMA_REGION) +
-			     SPDK_KV_SHIM_DMA_REGION) {
+		     probe = SPDK_ALIGN_FLOOR(probe, SPDK_SHIM_DMA_REGION) +
+			     SPDK_SHIM_DMA_REGION) {
 			uint64_t off = 0;
 
 			if (spdk_mem_get_fd_and_offset((void *)probe, &off) < 0) {
@@ -575,7 +575,7 @@ kv_mem_reachable(const struct spdk_kv_shim *sh, const void *vaddr, size_t len)
 }
 
 int
-spdk_kv_shim_mem_register(struct spdk_kv_shim *sh, void *vaddr, size_t len)
+spdk_shim_mem_register(struct spdk_shim *sh, void *vaddr, size_t len)
 {
 	int rc;
 
@@ -614,7 +614,7 @@ spdk_kv_shim_mem_register(struct spdk_kv_shim *sh, void *vaddr, size_t len)
 }
 
 int
-spdk_kv_shim_mem_unregister(void *vaddr, size_t len)
+spdk_shim_mem_unregister(void *vaddr, size_t len)
 {
 	if (vaddr == NULL || len == 0) {
 		return 0;
@@ -623,23 +623,23 @@ spdk_kv_shim_mem_unregister(void *vaddr, size_t len)
 }
 
 uint32_t
-spdk_kv_shim_sector_size(const struct spdk_kv_shim *sh)
+spdk_shim_sector_size(const struct spdk_shim *sh)
 {
 	return (sh != NULL && sh->is_block) ? sh->sector_size : 0;
 }
 
 uint64_t
-spdk_kv_shim_num_sectors(const struct spdk_kv_shim *sh)
+spdk_shim_num_sectors(const struct spdk_shim *sh)
 {
 	return (sh != NULL && sh->is_block) ? sh->num_sectors : 0;
 }
 
 uint32_t
-spdk_kv_shim_max_block_len_op(const struct spdk_kv_shim *sh)
+spdk_shim_max_block_len_op(const struct spdk_shim *sh)
 {
 	/*
 	 * A block op rides the SAME region-bounded SGL as a KV value, so its
-	 * single-op ceiling is the 33-region budget (SPDK_KV_SHIM_MAX_VALUE_LEN,
+	 * single-op ceiling is the 33-region budget (SPDK_SHIM_MAX_VALUE_LEN,
 	 * ~64 MiB) -- the target's iovec budget (NVMF_REQ_MAX_BUFFERS), NOT the
 	 * vfio-user default max_io_size (128 KiB, an unrelated per-transport
 	 * default). Unlike the KV-raw path this is deliberately NOT clamped to the
@@ -653,25 +653,25 @@ spdk_kv_shim_max_block_len_op(const struct spdk_kv_shim *sh)
 	if (sh == NULL || !sh->is_block) {
 		return 0;
 	}
-	return SPDK_KV_SHIM_MAX_VALUE_LEN;
+	return SPDK_SHIM_MAX_VALUE_LEN;
 }
 
 uint32_t
-spdk_kv_shim_max_value_len(const struct spdk_kv_shim *sh)
+spdk_shim_max_value_len(const struct spdk_shim *sh)
 {
 	return sh ? sh->kvvml : 0;
 }
 
 uint32_t
-spdk_kv_shim_max_key_len(const struct spdk_kv_shim *sh)
+spdk_shim_max_key_len(const struct spdk_shim *sh)
 {
 	return sh ? sh->kvkml : 0;
 }
 
 uint32_t
-spdk_kv_shim_max_value_len_op(const struct spdk_kv_shim *sh)
+spdk_shim_max_value_len_op(const struct spdk_shim *sh)
 {
-	uint32_t cap = SPDK_KV_SHIM_MAX_VALUE_LEN;
+	uint32_t cap = SPDK_SHIM_MAX_VALUE_LEN;
 
 	/*
 	 * The single-op KV-raw ceiling fixed at open (sh->max_xfer_op): the
@@ -700,7 +700,7 @@ static uint32_t
 kv_region_count(const void *base, uint32_t len)
 {
 	uint64_t addr = (uint64_t)(uintptr_t)base;
-	uint64_t first = SPDK_KV_SHIM_DMA_REGION - (addr & (SPDK_KV_SHIM_DMA_REGION - 1));
+	uint64_t first = SPDK_SHIM_DMA_REGION - (addr & (SPDK_SHIM_DMA_REGION - 1));
 
 	if (len == 0) {
 		return 0;
@@ -709,7 +709,7 @@ kv_region_count(const void *base, uint32_t len)
 		return 1;
 	}
 	return 1u + (uint32_t)spdk_divide_round_up((uint64_t)len - first,
-						   SPDK_KV_SHIM_DMA_REGION);
+						   SPDK_SHIM_DMA_REGION);
 }
 
 /* SGL iterator: restart the walk at \c offset (lib/nvme may re-drive it). */
@@ -720,7 +720,7 @@ kv_reset_sgl(void *cb_arg, uint32_t offset)
 	 * cb_arg is the op's fence tag (&sh->op_tag), shared with io_complete; the
 	 * SGL iterator lives in the enclosing shim, so recover it from the tag.
 	 */
-	struct spdk_kv_shim *sh = SPDK_CONTAINEROF(cb_arg, struct spdk_kv_shim, op_tag);
+	struct spdk_shim *sh = SPDK_CONTAINEROF(cb_arg, struct spdk_shim, op_tag);
 
 	sh->sgl_off = offset;
 }
@@ -735,11 +735,11 @@ static int
 kv_next_sge(void *cb_arg, void **address, uint32_t *length)
 {
 	/* cb_arg is &sh->op_tag (shared with io_complete); recover the shim. */
-	struct spdk_kv_shim *sh = SPDK_CONTAINEROF(cb_arg, struct spdk_kv_shim, op_tag);
+	struct spdk_shim *sh = SPDK_CONTAINEROF(cb_arg, struct spdk_shim, op_tag);
 	uint64_t addr = (uint64_t)(uintptr_t)sh->sgl_base + sh->sgl_off;
 	uint32_t remaining = sh->sgl_total - sh->sgl_off;
 	uint32_t to_boundary =
-		(uint32_t)(SPDK_KV_SHIM_DMA_REGION - (addr & (SPDK_KV_SHIM_DMA_REGION - 1)));
+		(uint32_t)(SPDK_SHIM_DMA_REGION - (addr & (SPDK_SHIM_DMA_REGION - 1)));
 	uint32_t seg = remaining < to_boundary ? remaining : to_boundary;
 
 	*address = (void *)(uintptr_t)addr;
@@ -759,7 +759,7 @@ kv_next_sge(void *cb_arg, void **address, uint32_t *length)
  * for Retrieve is the device's TRUE stored value length.
  */
 static int
-kv_xfer_sgl(struct spdk_kv_shim *sh, uint8_t opc, const void *key, uint8_t key_len,
+kv_xfer_sgl(struct spdk_shim *sh, uint8_t opc, const void *key, uint8_t key_len,
 	    void *value, uint32_t value_len, uint32_t *cdw0_out)
 {
 	struct spdk_nvme_cmd cmd;
@@ -785,21 +785,21 @@ kv_xfer_sgl(struct spdk_kv_shim *sh, uint8_t opc, const void *key, uint8_t key_l
 	/*
 	 * Byte-length guard (mirrors blk_rw's dual guard): reject a value past the
 	 * single-op ceiling BEFORE building the command, enforcing the documented
-	 * spdk_kv_shim_max_value_len_op() bound directly rather than trusting the
+	 * spdk_shim_max_value_len_op() bound directly rather than trusting the
 	 * backend's pre-alloc clamp. A 2 MiB-aligned value can hit exactly the
 	 * 33-region budget while still exceeding the byte bound, so the region-count
 	 * check below does NOT subsume this. NO striping.
 	 */
-	if (value_len > spdk_kv_shim_max_value_len_op(sh)) {
+	if (value_len > spdk_shim_max_value_len_op(sh)) {
 		return -EFBIG;
 	}
 	/*
 	 * NO striping: reject a value that needs more than the region budget
 	 * (NVMF_REQ_MAX_BUFFERS = 33) rather than splitting it across ops. The
 	 * budget is also enforced pre-alloc by the backend via
-	 * spdk_kv_shim_max_value_len_op(); this is the authoritative guard.
+	 * spdk_shim_max_value_len_op(); this is the authoritative guard.
 	 */
-	if (kv_region_count(value, value_len) > SPDK_KV_SHIM_MAX_SGL_REGIONS) {
+	if (kv_region_count(value, value_len) > SPDK_SHIM_MAX_SGL_REGIONS) {
 		return -EFBIG;
 	}
 
@@ -821,7 +821,7 @@ kv_xfer_sgl(struct spdk_kv_shim *sh, uint8_t opc, const void *key, uint8_t key_l
 	sh->sgl_off = 0;
 
 	/* Refuse to submit onto a poisoned (timed-out / fenced) qpair. */
-	if (!spdk_kv_fence_begin(&sh->fence, &sh->op_tag)) {
+	if (!spdk_fence_begin(&sh->fence, &sh->op_tag)) {
 		return -ESHUTDOWN;
 	}
 	rc = spdk_nvme_ctrlr_cmd_iov_raw_with_md(sh->ctrlr, sh->qpair, &cmd, value_len,
@@ -849,7 +849,7 @@ kv_xfer_sgl(struct spdk_kv_shim *sh, uint8_t opc, const void *key, uint8_t key_l
 }
 
 int
-spdk_kv_shim_store(struct spdk_kv_shim *sh, const void *key, uint8_t key_len,
+spdk_shim_store(struct spdk_shim *sh, const void *key, uint8_t key_len,
 		   const void *value, uint32_t value_len)
 {
 	return kv_xfer_sgl(sh, SPDK_NVME_OPC_KV_STORE, key, key_len,
@@ -857,7 +857,7 @@ spdk_kv_shim_store(struct spdk_kv_shim *sh, const void *key, uint8_t key_len,
 }
 
 int
-spdk_kv_shim_retrieve(struct spdk_kv_shim *sh, const void *key, uint8_t key_len,
+spdk_shim_retrieve(struct spdk_shim *sh, const void *key, uint8_t key_len,
 		      void *value, uint32_t buf_len, uint32_t *value_len_out)
 {
 	uint32_t cdw0 = 0;
@@ -899,7 +899,7 @@ spdk_kv_shim_retrieve(struct spdk_kv_shim *sh, const void *key, uint8_t key_len,
 }
 
 int
-spdk_kv_shim_exist(struct spdk_kv_shim *sh, const void *key, uint8_t key_len)
+spdk_shim_exist(struct spdk_shim *sh, const void *key, uint8_t key_len)
 {
 	int rc;
 
@@ -914,7 +914,7 @@ spdk_kv_shim_exist(struct spdk_kv_shim *sh, const void *key, uint8_t key_len)
 		return -EINVAL;
 	}
 	/* Refuse to submit onto a poisoned (timed-out / fenced) qpair. */
-	if (!spdk_kv_fence_begin(&sh->fence, &sh->op_tag)) {
+	if (!spdk_fence_begin(&sh->fence, &sh->op_tag)) {
 		return -ESHUTDOWN;
 	}
 	rc = spdk_nvme_kv_exist(sh->ns, sh->qpair, key, key_len, io_complete, &sh->op_tag);
@@ -945,7 +945,7 @@ spdk_kv_shim_exist(struct spdk_kv_shim *sh, const void *key, uint8_t key_len)
  * poll loop and completion capture as the KV ops.
  */
 static int
-blk_rw(struct spdk_kv_shim *sh, bool is_write, void *buf, uint64_t lba,
+blk_rw(struct spdk_shim *sh, bool is_write, void *buf, uint64_t lba,
        uint32_t lba_count)
 {
 	uint64_t total_bytes;
@@ -974,7 +974,7 @@ blk_rw(struct spdk_kv_shim *sh, bool is_write, void *buf, uint64_t lba,
 	 * here rather than wrapping. NO striping.
 	 */
 	total_bytes = (uint64_t)lba_count * sh->sector_size;
-	if (total_bytes > SPDK_KV_SHIM_MAX_VALUE_LEN) {
+	if (total_bytes > SPDK_SHIM_MAX_VALUE_LEN) {
 		return -EFBIG;
 	}
 	byte_len = (uint32_t)total_bytes;
@@ -982,7 +982,7 @@ blk_rw(struct spdk_kv_shim *sh, bool is_write, void *buf, uint64_t lba,
 	 * Authoritative region-budget guard (mirrors kv_xfer_sgl): reject a buffer
 	 * that needs more than NVMF_REQ_MAX_BUFFERS (33) region-bounded descriptors.
 	 */
-	if (kv_region_count(buf, byte_len) > SPDK_KV_SHIM_MAX_SGL_REGIONS) {
+	if (kv_region_count(buf, byte_len) > SPDK_SHIM_MAX_SGL_REGIONS) {
 		return -EFBIG;
 	}
 
@@ -991,7 +991,7 @@ blk_rw(struct spdk_kv_shim *sh, bool is_write, void *buf, uint64_t lba,
 	sh->sgl_off = 0;
 
 	/* Refuse to submit onto a poisoned (timed-out / fenced) qpair. */
-	if (!spdk_kv_fence_begin(&sh->fence, &sh->op_tag)) {
+	if (!spdk_fence_begin(&sh->fence, &sh->op_tag)) {
 		return -ESHUTDOWN;
 	}
 	if (is_write) {
@@ -1014,14 +1014,14 @@ blk_rw(struct spdk_kv_shim *sh, bool is_write, void *buf, uint64_t lba,
 }
 
 int
-spdk_kv_shim_write(struct spdk_kv_shim *sh, const void *buf, uint64_t lba,
+spdk_shim_write(struct spdk_shim *sh, const void *buf, uint64_t lba,
 		   uint32_t lba_count)
 {
 	return blk_rw(sh, true, (void *)(uintptr_t)buf, lba, lba_count);
 }
 
 int
-spdk_kv_shim_read(struct spdk_kv_shim *sh, void *buf, uint64_t lba,
+spdk_shim_read(struct spdk_shim *sh, void *buf, uint64_t lba,
 		  uint32_t lba_count)
 {
 	return blk_rw(sh, false, buf, lba, lba_count);

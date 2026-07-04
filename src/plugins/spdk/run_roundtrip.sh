@@ -20,21 +20,21 @@
 #              plugin links against may carry only the NVMe-KV *host* driver; if
 #              it has no nvmf_tgt built, point SPDK_ROOT at a target-capable KV
 #              SPDK build.
-#   TEST_BIN   path to the built spdk_kv_roundtrip_test binary
+#   TEST_BIN   path to the built spdk_roundtrip_test binary
 set -euo pipefail
 
 if [[ -z "${SPDK_ROOT:-}" ]]; then
     echo "error: SPDK_ROOT must be set to a target-capable NVMe-KV SPDK build" >&2
     exit 1
 fi
-TEST_BIN="${TEST_BIN:-$(dirname "$0")/../../../builddir/src/plugins/spdk_kv/spdk_kv_roundtrip_test}"
+TEST_BIN="${TEST_BIN:-$(dirname "$0")/../../../builddir/src/plugins/spdk/spdk_roundtrip_test}"
 TEST_BIN="$(readlink -f "$TEST_BIN")"
 
 source "$(dirname "$0")/tgt_common.sh"
 
 nqn="nqn.2026-06.io.spdk:spdk-kv-cnode0"
 kvdev_name="SpdkKvMem0"
-tgt_setup spdk_kv_rt
+tgt_setup spdk_rt
 
 # -s 1024: headroom for mapping the client's up-to-~64 MiB DMA regions plus the
 # in-memory kvdev holding several large stored values simultaneously.

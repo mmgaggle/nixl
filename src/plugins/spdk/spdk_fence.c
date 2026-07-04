@@ -17,16 +17,16 @@
 
 /*
  * Pure, SPDK-free implementation of the shim fence: stale-orphan discard,
- * poison latch, and staging-buffer quarantine. See spdk_kv_fence.h.
+ * poison latch, and staging-buffer quarantine. See spdk_fence.h.
  */
 
-#include "spdk_kv_fence.h"
+#include "spdk_fence.h"
 
 #include <errno.h>
 #include <stdlib.h>
 
 void
-spdk_kv_fence_init(struct spdk_kv_fence *f)
+spdk_fence_init(struct spdk_fence *f)
 {
 	f->gen = 0;
 	f->op_done = false;
@@ -38,7 +38,7 @@ spdk_kv_fence_init(struct spdk_kv_fence *f)
 }
 
 bool
-spdk_kv_fence_begin(struct spdk_kv_fence *f, struct spdk_kv_op_tag *tag)
+spdk_fence_begin(struct spdk_fence *f, struct spdk_op_tag *tag)
 {
 	if (f->poisoned) {
 		return false;
@@ -55,10 +55,10 @@ spdk_kv_fence_begin(struct spdk_kv_fence *f, struct spdk_kv_op_tag *tag)
 }
 
 bool
-spdk_kv_fence_complete(struct spdk_kv_op_tag *tag, uint8_t sct, uint8_t sc,
+spdk_fence_complete(struct spdk_op_tag *tag, uint8_t sct, uint8_t sc,
 		       uint32_t cdw0)
 {
-	struct spdk_kv_fence *f = tag->fence;
+	struct spdk_fence *f = tag->fence;
 
 	if (tag->gen != f->gen) {
 		/* Stale orphan from a previously abandoned op: leave the current
@@ -73,27 +73,27 @@ spdk_kv_fence_complete(struct spdk_kv_op_tag *tag, uint8_t sct, uint8_t sc,
 }
 
 bool
-spdk_kv_fence_done(const struct spdk_kv_fence *f)
+spdk_fence_done(const struct spdk_fence *f)
 {
 	return f->op_done;
 }
 
 void
-spdk_kv_fence_poison(struct spdk_kv_fence *f)
+spdk_fence_poison(struct spdk_fence *f)
 {
 	f->poisoned = true;
 }
 
 bool
-spdk_kv_fence_poisoned(const struct spdk_kv_fence *f)
+spdk_fence_poisoned(const struct spdk_fence *f)
 {
 	return f->poisoned;
 }
 
 int
-spdk_kv_fence_quarantine(struct spdk_kv_fence *f, void *buf)
+spdk_fence_quarantine(struct spdk_fence *f, void *buf)
 {
-	struct spdk_kv_quarantine_node *n;
+	struct spdk_quarantine_node *n;
 
 	if (buf == NULL) {
 		return 0;
@@ -109,12 +109,12 @@ spdk_kv_fence_quarantine(struct spdk_kv_fence *f, void *buf)
 }
 
 void
-spdk_kv_fence_drain(struct spdk_kv_fence *f, void (*free_buf)(void *))
+spdk_fence_drain(struct spdk_fence *f, void (*free_buf)(void *))
 {
-	struct spdk_kv_quarantine_node *n = f->quarantine;
+	struct spdk_quarantine_node *n = f->quarantine;
 
 	while (n != NULL) {
-		struct spdk_kv_quarantine_node *next = n->next;
+		struct spdk_quarantine_node *next = n->next;
 
 		if (free_buf != NULL) {
 			free_buf(n->buf);

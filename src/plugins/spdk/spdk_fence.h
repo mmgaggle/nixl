@@ -36,8 +36,8 @@
  * lets a completion tell concurrent ops apart, so none of this logic changes.
  */
 
-#ifndef SPDK_KV_FENCE_H
-#define SPDK_KV_FENCE_H
+#ifndef SPDK_FENCE_H
+#define SPDK_FENCE_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -48,17 +48,17 @@ extern "C" {
 #endif
 
 /** A quarantined staging buffer awaiting release after the fencing teardown. */
-struct spdk_kv_quarantine_node {
+struct spdk_quarantine_node {
 	void				*buf;
-	struct spdk_kv_quarantine_node	*next;
+	struct spdk_quarantine_node	*next;
 };
 
 /**
  * Fence state for the shim's single in-flight op slot. Zero-initialization
  * (e.g. calloc) yields the clean, un-poisoned, empty-quarantine state, which is
- * what spdk_kv_fence_init() also produces.
+ * what spdk_fence_init() also produces.
  */
-struct spdk_kv_fence {
+struct spdk_fence {
 	/*
 	 * Generation of the op the current poller is waiting for. Bumped on every
 	 * begin(); a completion whose captured generation differs is a stale orphan
@@ -81,20 +81,20 @@ struct spdk_kv_fence {
 	bool				poisoned;
 	/* Staging buffers from poisoned ops, released only once drain() runs after
 	 * the fencing teardown proves the tracker dead. */
-	struct spdk_kv_quarantine_node	*quarantine;
+	struct spdk_quarantine_node	*quarantine;
 };
 
 /**
  * Per-op completion callback argument: carries the fence plus the submit-time
  * generation so a completion callback can reject a late orphan.
  */
-struct spdk_kv_op_tag {
-	struct spdk_kv_fence		*fence;
+struct spdk_op_tag {
+	struct spdk_fence		*fence;
 	uint64_t			gen;
 };
 
 /** Initialise a fence to the clean, un-poisoned, empty-quarantine state. */
-void spdk_kv_fence_init(struct spdk_kv_fence *f);
+void spdk_fence_init(struct spdk_fence *f);
 
 /**
  * Begin a new op. If the fence is poisoned, refuse (return false, change
@@ -102,7 +102,7 @@ void spdk_kv_fence_init(struct spdk_kv_fence *f);
  * \c tag with this op's identity, and return true. Hand \c tag to the submit
  * call as its completion cb_arg.
  */
-bool spdk_kv_fence_begin(struct spdk_kv_fence *f, struct spdk_kv_op_tag *tag);
+bool spdk_fence_begin(struct spdk_fence *f, struct spdk_op_tag *tag);
 
 /**
  * Record a completion for the op identified by \c tag. If the tag's generation
@@ -111,17 +111,17 @@ bool spdk_kv_fence_begin(struct spdk_kv_fence *f, struct spdk_kv_op_tag *tag);
  * left intact. Otherwise the status is captured, op_done is latched, and it
  * returns true.
  */
-bool spdk_kv_fence_complete(struct spdk_kv_op_tag *tag, uint8_t sct, uint8_t sc,
+bool spdk_fence_complete(struct spdk_op_tag *tag, uint8_t sct, uint8_t sc,
 			    uint32_t cdw0);
 
 /** True once the in-flight op's completion has been recorded. */
-bool spdk_kv_fence_done(const struct spdk_kv_fence *f);
+bool spdk_fence_done(const struct spdk_fence *f);
 
 /** Latch the fence poisoned after a timeout / transport failure. Idempotent. */
-void spdk_kv_fence_poison(struct spdk_kv_fence *f);
+void spdk_fence_poison(struct spdk_fence *f);
 
 /** True while the fence is poisoned (refusing new ops until drain()). */
-bool spdk_kv_fence_poisoned(const struct spdk_kv_fence *f);
+bool spdk_fence_poisoned(const struct spdk_fence *f);
 
 /**
  * Quarantine staging buffer \c buf whose op left a possibly-live DMA tracker,
@@ -130,7 +130,7 @@ bool spdk_kv_fence_poisoned(const struct spdk_kv_fence *f);
  * case the caller MUST NOT free \c buf (leaking it is strictly safer than a
  * use-after-free into memory the recovered target may still DMA into).
  */
-int spdk_kv_fence_quarantine(struct spdk_kv_fence *f, void *buf);
+int spdk_fence_quarantine(struct spdk_fence *f, void *buf);
 
 /**
  * Release every quarantined buffer with \c free_buf (invoked exactly once per
@@ -138,10 +138,10 @@ int spdk_kv_fence_quarantine(struct spdk_kv_fence *f, void *buf);
  * only after a fencing teardown (qpair free / ctrlr reset) has proven the
  * hardware trackers dead, so no completion can reference a freed buffer.
  */
-void spdk_kv_fence_drain(struct spdk_kv_fence *f, void (*free_buf)(void *));
+void spdk_fence_drain(struct spdk_fence *f, void (*free_buf)(void *));
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* SPDK_KV_FENCE_H */
+#endif /* SPDK_FENCE_H */

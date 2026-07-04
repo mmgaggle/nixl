@@ -17,7 +17,7 @@
  * Direct-engine round-trip test for the generic SPDK backend (Store /
  * Retrieve, Exist, value auto-sizing, and large values).
  *
- * Instantiates nixlSpdkKvEngine directly (no nixlAgent), registers a DRAM
+ * Instantiates nixlSpdkEngine directly (no nixlAgent), registers a DRAM
  * source buffer and an OBJ_SEG remote descriptor carrying a 16-byte inline key
  * (verbatim, opaque) in metaInfo, then:
  *   1. WRITE (DRAM -> remote)  => KV Store
@@ -36,9 +36,9 @@
  *      the true length, then a resized re-Retrieve is byte-exact) and the NO-
  *      striping guard (a value past the ~64 MiB single-op bound is rejected).
  *
- * Usage: spdk_kv_roundtrip_test <transport-id-or-vfio-user-dir>
- *   e.g. spdk_kv_roundtrip_test "trtype:VFIOUSER traddr:/tmp/.../muser0/0"
- *   or   spdk_kv_roundtrip_test /tmp/.../muser0/0   (wrapped into VFIOUSER)
+ * Usage: spdk_roundtrip_test <transport-id-or-vfio-user-dir>
+ *   e.g. spdk_roundtrip_test "trtype:VFIOUSER traddr:/tmp/.../muser0/0"
+ *   or   spdk_roundtrip_test /tmp/.../muser0/0   (wrapped into VFIOUSER)
  */
 
 #include <cstdint>
@@ -50,9 +50,9 @@
 
 #include <sys/mman.h> // mmap/munmap for the partial-reachability construction
 
-#include "spdk_kv_test_common.h"
+#include "spdk_test_common.h"
 
-using namespace spdk_kv_test;
+using namespace spdk_test;
 
 int
 main(int argc, char **argv) {
@@ -60,7 +60,7 @@ main(int argc, char **argv) {
         std::cerr << "usage: " << argv[0] << " <transport-id-or-vfio-user-dir>\n";
         return 2;
     }
-    const char *kAgent = "spdk_kv_test_agent";
+    const char *kAgent = "spdk_test_agent";
     const std::string agent = kAgent;
 
     // Standalone test: no host owns the SPDK env, so this engine brings it up.
@@ -69,11 +69,11 @@ main(int argc, char **argv) {
         std::cerr << "FAIL: engine init error (shim open failed)\n";
         return 1;
     }
-    nixlSpdkKvEngine &eng = *eng_ptr;
+    nixlSpdkEngine &eng = *eng_ptr;
     std::cout << "engine initialized against '" << argv[1] << "'\n";
 
     // --- Source / destination DRAM buffers ---
-    const std::string payload = "SPDK_KV-NIXL-roundtrip-small-value-0123456789";
+    const std::string payload = "SPDK-NIXL-roundtrip-small-value-0123456789";
     std::vector<uint8_t> src(payload.begin(), payload.end());
     std::vector<uint8_t> dst(src.size(), 0);
 
@@ -373,7 +373,7 @@ main(int argc, char **argv) {
     // sufficient (and proves the reject is not a partial/striped transfer).
     {
         const size_t oversize =
-            static_cast<size_t>(SPDK_KV_SHIM_MAX_VALUE_LEN) + 4 * 1024 * 1024;
+            static_cast<size_t>(SPDK_SHIM_MAX_VALUE_LEN) + 4 * 1024 * 1024;
         std::vector<uint8_t> tiny(4096, 0);
         const uint64_t dram_dev = 0, key_dev = 1;
         const std::string big_key = "nixl-oversize-01"; // 16 bytes, opaque
@@ -405,7 +405,7 @@ main(int argc, char **argv) {
             return 1;
         }
         std::cout << "oversize value (" << (oversize / (1024 * 1024)) << " MiB > "
-                  << (SPDK_KV_SHIM_MAX_VALUE_LEN / (1024 * 1024))
+                  << (SPDK_SHIM_MAX_VALUE_LEN / (1024 * 1024))
                   << " MiB single-op bound) correctly rejected (not split)\n";
     }
 
@@ -573,8 +573,8 @@ main(int argc, char **argv) {
     // could not be set up.
     {
 #ifdef MAP_FIXED_NOREPLACE
-        const size_t region = SPDK_KV_SHIM_DMA_REGION; // 2 MiB
-        void *base = spdk_kv_shim_dma_alloc_aligned(region, region); // fd-backed
+        const size_t region = SPDK_SHIM_DMA_REGION; // 2 MiB
+        void *base = spdk_shim_dma_alloc_aligned(region, region); // fd-backed
         bool skipped = true;
         if (base != nullptr) {
             void *tail_at = static_cast<void *>(static_cast<uint8_t *>(base) + region);
@@ -618,7 +618,7 @@ main(int argc, char **argv) {
                 munmap(tail, region);
                 if (rc != 0) {
                     std::cerr << "FAIL: partial-reachability staged round-trip (rc=" << rc << ")\n";
-                    spdk_kv_shim_dma_free(base);
+                    spdk_shim_dma_free(base);
                     return 1;
                 }
                 std::cout << "partial-reachability OK: fd-backed base + anonymous tail "
@@ -626,7 +626,7 @@ main(int argc, char **argv) {
             } else if (tail != MAP_FAILED) {
                 munmap(tail, region);
             }
-            spdk_kv_shim_dma_free(base);
+            spdk_shim_dma_free(base);
         }
         if (skipped) {
             std::cout << "partial-reachability check SKIPPED: no free virtual slot after the "
@@ -724,6 +724,6 @@ main(int argc, char **argv) {
                      "is rejected at prepXfer; neither value stored (no partial mutation)\n";
     }
 
-    std::cout << "spdk_kv_roundtrip_test: PASS\n";
+    std::cout << "spdk_roundtrip_test: PASS\n";
     return 0;
 }

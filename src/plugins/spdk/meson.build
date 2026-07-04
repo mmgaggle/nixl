@@ -17,7 +17,7 @@
 # SPDK plugin: a clean-sheet, transport-agnostic, backend-agnostic NIXL
 # backend that speaks the ratified NVMe Key-Value command set over the SPDK
 # NVMe driver (lib/nvme). WRITE -> KV Store, READ -> KV Retrieve. It ships its
-# OWN generic host shim (spdk_kv_shim.{h,c}); it does NOT depend on any external
+# OWN generic host shim (spdk_shim.{h,c}); it does NOT depend on any external
 # host shim.
 # ---------------------------------------------------------------------------
 
@@ -45,7 +45,7 @@ if not fs.exists(spdk_inc / 'spdk' / 'nvme_kv.h')
 endif
 
 # The top-level project() declares only C++ (and optionally CUDA); it does NOT
-# enable the C language. This plugin compiles its own C shim (spdk_kv_shim.c),
+# enable the C language. This plugin compiles its own C shim (spdk_shim.c),
 # so enable the host C compiler here. This keeps the SPDK plugin self-contained: it
 # does not rely on another plugin having flipped the project languages to include C.
 # add_languages is idempotent, so this is a no-op if C was already enabled by a
@@ -60,17 +60,17 @@ endif
 cc = meson.get_compiler('c')
 
 # Include dirs: the plugin's own headers, plus the SPDK C headers (needed by
-# the C shim and by the C++ TUs that include spdk_kv_shim.h).
-spdk_kv_local_inc = include_directories('.')
-spdk_kv_spdk_inc = include_directories(spdk_inc, spdk_build_inc, is_system: true)
+# the C shim and by the C++ TUs that include spdk_shim.h).
+spdk_local_inc = include_directories('.')
+spdk_spdk_inc = include_directories(spdk_inc, spdk_build_inc, is_system: true)
 
-# Build the C shim (spdk_kv_shim.c) into its own static lib so the C compile
+# Build the C shim (spdk_shim.c) into its own static lib so the C compile
 # flags and the C-only SPDK headers stay isolated from the C++ plugin TUs.
-spdk_kv_shim_lib = static_library(
-    'nixl_spdk_kv_shim',
-    ['spdk_kv_shim.c', 'spdk_kv_fence.c'],
+spdk_shim_lib = static_library(
+    'nixl_spdk_shim',
+    ['spdk_shim.c', 'spdk_fence.c'],
     c_args: ['-D_GNU_SOURCE', '-w'],
-    include_directories: [spdk_kv_local_inc, spdk_kv_spdk_inc],
+    include_directories: [spdk_local_inc, spdk_spdk_inc],
     install: false,
 )
 
@@ -128,87 +128,87 @@ foreach syslib : ['numa', 'dl', 'rt', 'uuid', 'ssl', 'crypto', 'm', 'lz4',
     endif
 endforeach
 
-spdk_kv_sources = [
-    'spdk_kv_backend.cpp',
-    'spdk_kv_backend.h',
-    'spdk_kv_key.cpp',
-    'spdk_kv_key.h',
-    'spdk_kv_plugin.cpp',
+spdk_sources = [
+    'spdk_backend.cpp',
+    'spdk_backend.h',
+    'spdk_key.cpp',
+    'spdk_key.h',
+    'spdk_plugin.cpp',
 ]
 
 plugin_deps = [nixl_infra, nixl_common_dep]
-spdk_kv_inc = [nixl_inc_dirs, utils_inc_dirs, spdk_kv_local_inc, spdk_kv_spdk_inc]
+spdk_inc = [nixl_inc_dirs, utils_inc_dirs, spdk_local_inc, spdk_spdk_inc]
 
 if 'SPDK' in static_plugins
-    spdk_kv_backend_lib = static_library(
+    spdk_backend_lib = static_library(
         'SPDK',
-        spdk_kv_sources,
+        spdk_sources,
         dependencies: plugin_deps,
-        link_with: spdk_kv_shim_lib,
+        link_with: spdk_shim_lib,
         link_args: spdk_link_args,
-        include_directories: spdk_kv_inc,
+        include_directories: spdk_inc,
         install: false,
         name_prefix: 'libplugin_')
 else
-    spdk_kv_backend_lib = shared_library(
+    spdk_backend_lib = shared_library(
         'SPDK',
-        spdk_kv_sources,
+        spdk_sources,
         dependencies: plugin_deps,
-        link_with: spdk_kv_shim_lib,
+        link_with: spdk_shim_lib,
         link_args: spdk_link_args,
         cpp_args: ['-fPIC'],
-        include_directories: spdk_kv_inc,
+        include_directories: spdk_inc,
         install: true,
         name_prefix: 'libplugin_',
         install_dir: plugin_install_dir,
         install_rpath: '$ORIGIN/..')
     if get_option('buildtype') == 'debug'
         run_command('sh', '-c',
-            'echo "SPDK=' + spdk_kv_backend_lib.full_path() + '" >> ' + plugin_build_dir + '/pluginlist',
+            'echo "SPDK=' + spdk_backend_lib.full_path() + '" >> ' + plugin_build_dir + '/pluginlist',
             check: true
         )
     endif
 endif
 
 if 'SPDK' in static_plugins
-    spdk_kv_backend_interface = declare_dependency(link_whole: spdk_kv_backend_lib)
+    spdk_backend_interface = declare_dependency(link_whole: spdk_backend_lib)
 else
-    spdk_kv_backend_interface = declare_dependency(link_with: spdk_kv_backend_lib)
+    spdk_backend_interface = declare_dependency(link_with: spdk_backend_lib)
 endif
 
 # Direct-engine round-trip tests (link the engine TUs + shim against a live SPDK
-# target). Enabled by -Dspdk_kv_build_test=true. The KV test drives the OBJ_SEG
+# target). Enabled by -Dspdk_build_test=true. The KV test drives the OBJ_SEG
 # Store/Retrieve path; the block test drives the BLK_SEG LBA read/write path.
-if get_option('spdk_kv_build_test')
+if get_option('spdk_build_test')
     # Pure-logic unit test for the timeout/orphan/quarantine fence. It links only
-    # the SPDK-free spdk_kv_fence.c (no lib/nvme, no live target, no hugepages),
+    # the SPDK-free spdk_fence.c (no lib/nvme, no live target, no hugepages),
     # so it exercises the stale-orphan discard, poison latch, and staging-buffer
     # quarantine accounting standalone.
     executable(
-        'spdk_kv_fence_test',
-        ['spdk_kv_fence_test.c', 'spdk_kv_fence.c'],
+        'spdk_fence_test',
+        ['spdk_fence_test.c', 'spdk_fence.c'],
         c_args: ['-D_GNU_SOURCE'],
-        include_directories: [spdk_kv_local_inc],
+        include_directories: [spdk_local_inc],
         install: false,
     )
     executable(
-        'spdk_kv_roundtrip_test',
-        ['spdk_kv_roundtrip_test.cpp', 'spdk_kv_backend.cpp', 'spdk_kv_backend.h',
-         'spdk_kv_key.cpp', 'spdk_kv_key.h'],
+        'spdk_roundtrip_test',
+        ['spdk_roundtrip_test.cpp', 'spdk_backend.cpp', 'spdk_backend.h',
+         'spdk_key.cpp', 'spdk_key.h'],
         dependencies: plugin_deps,
-        link_with: spdk_kv_shim_lib,
+        link_with: spdk_shim_lib,
         link_args: spdk_link_args,
-        include_directories: spdk_kv_inc,
+        include_directories: spdk_inc,
         install: false,
     )
     executable(
-        'spdk_kv_block_roundtrip_test',
-        ['spdk_kv_block_roundtrip_test.cpp', 'spdk_kv_backend.cpp', 'spdk_kv_backend.h',
-         'spdk_kv_key.cpp', 'spdk_kv_key.h'],
+        'spdk_block_roundtrip_test',
+        ['spdk_block_roundtrip_test.cpp', 'spdk_backend.cpp', 'spdk_backend.h',
+         'spdk_key.cpp', 'spdk_key.h'],
         dependencies: plugin_deps,
-        link_with: spdk_kv_shim_lib,
+        link_with: spdk_shim_lib,
         link_args: spdk_link_args,
-        include_directories: spdk_kv_inc,
+        include_directories: spdk_inc,
         install: false,
     )
 endif

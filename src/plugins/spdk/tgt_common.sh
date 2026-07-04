@@ -13,7 +13,7 @@
 #
 # Usage:
 #   source "$(dirname "$0")/tgt_common.sh"
-#   tgt_setup <sock-dir-prefix>     # e.g. spdk_kv_rt
+#   tgt_setup <sock-dir-prefix>     # e.g. spdk_rt
 #   tgt_start <heap-size-MiB>       # deliberate per-script -s heap size
 #   tgt_create_vfiouser_transport
 #   ... caller's bdev/kvdev + subsystem + namespace RPCs ...

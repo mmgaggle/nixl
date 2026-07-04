@@ -17,7 +17,7 @@
  * Direct-engine round-trip test for the generic SPDK backend's BLOCK (BLK_SEG)
  * datapath -- NVMe LBA read/write alongside the KV path in the same plugin.
  *
- * Instantiates nixlSpdkKvEngine directly (no nixlAgent) with the block namespace
+ * Instantiates nixlSpdkEngine directly (no nixlAgent) with the block namespace
  * knob (csi=block), registers a DRAM source/destination buffer and a BLK_SEG
  * remote descriptor whose addr is the starting LBA and devId is the namespace,
  * then:
@@ -51,9 +51,9 @@
  * 512- or 4096-byte-sector namespace; the misalignment case (a length that is
  * not a multiple of 512) is rejected on either.
  *
- * Usage: spdk_kv_block_roundtrip_test <transport-id-or-vfio-user-dir>
- *   e.g. spdk_kv_block_roundtrip_test "trtype:VFIOUSER traddr:/tmp/.../muser0/0"
- *   or   spdk_kv_block_roundtrip_test /tmp/.../muser0/0   (wrapped into VFIOUSER)
+ * Usage: spdk_block_roundtrip_test <transport-id-or-vfio-user-dir>
+ *   e.g. spdk_block_roundtrip_test "trtype:VFIOUSER traddr:/tmp/.../muser0/0"
+ *   or   spdk_block_roundtrip_test /tmp/.../muser0/0   (wrapped into VFIOUSER)
  */
 
 #include <cstdint>
@@ -62,9 +62,9 @@
 #include <string>
 #include <vector>
 
-#include "spdk_kv_test_common.h"
+#include "spdk_test_common.h"
 
-using namespace spdk_kv_test;
+using namespace spdk_test;
 
 namespace {
 
@@ -76,7 +76,7 @@ namespace {
 // any DMA is staged, which also proves the reject is not a partial/striped
 // transfer. Returns true iff the reject matched `expected`.
 bool
-expectReject(nixlSpdkKvEngine &eng, const std::string &agent, uint64_t lba, size_t size,
+expectReject(nixlSpdkEngine &eng, const std::string &agent, uint64_t lba, size_t size,
              nixl_status_t expected) {
     std::vector<uint8_t> tiny(4096, 0);
     const uint64_t dram_dev = 0, blk_dev = 1;
@@ -131,7 +131,7 @@ expectReject(nixlSpdkKvEngine &eng, const std::string &agent, uint64_t lba, size
 // (sector-aligned, in-range, single-range) length. Returns true on success.
 // Drives writes/reads independently so a caller can address distinct LBAs.
 bool
-blockOp(nixlSpdkKvEngine &eng, const std::string &agent, nixl_xfer_op_t op, uint64_t lba,
+blockOp(nixlSpdkEngine &eng, const std::string &agent, nixl_xfer_op_t op, uint64_t lba,
         std::vector<uint8_t> &data) {
     const size_t size = data.size();
     const uint64_t dram_dev = 0, blk_dev = 1;
@@ -174,7 +174,7 @@ main(int argc, char **argv) {
         std::cerr << "FAIL: engine init error (block shim open failed)\n";
         return 1;
     }
-    nixlSpdkKvEngine &eng = *eng_ptr;
+    nixlSpdkEngine &eng = *eng_ptr;
     std::cout << "engine initialized (block mode) against '" << argv[1] << "'\n";
 
     // --- Block round-trip across sizes (4 KiB .. ~60 MiB) ---
@@ -376,13 +376,13 @@ main(int argc, char **argv) {
         // alignment and is caught by the single-op bound guard, before any DMA is
         // staged (proving the reject is not a partial/striped transfer).
         const size_t oversize =
-            static_cast<size_t>(SPDK_KV_SHIM_MAX_VALUE_LEN) + 4 * 1024 * 1024;
+            static_cast<size_t>(SPDK_SHIM_MAX_VALUE_LEN) + 4 * 1024 * 1024;
         if (!expectReject(eng, agent, /*lba=*/0, oversize, NIXL_ERR_INVALID_PARAM)) {
             std::cerr << "FAIL: over-single-op-bound length (" << oversize << " B) reject\n";
             return 1;
         }
         std::cout << "oversize length (" << (oversize / (1024 * 1024)) << " MiB > "
-                  << (SPDK_KV_SHIM_MAX_VALUE_LEN / (1024 * 1024))
+                  << (SPDK_SHIM_MAX_VALUE_LEN / (1024 * 1024))
                   << " MiB single-op bound) correctly rejected (NIXL_ERR_INVALID_PARAM, not split)\n";
 
         // LBA range past the namespace capacity (well beyond any malloc bdev here).
@@ -493,6 +493,6 @@ main(int argc, char **argv) {
                      "getSupportedMems/registerMem/queryMem/prepXfer (no wild-LBA KV op)\n";
     }
 
-    std::cout << "spdk_kv_block_roundtrip_test: PASS\n";
+    std::cout << "spdk_block_roundtrip_test: PASS\n";
     return 0;
 }

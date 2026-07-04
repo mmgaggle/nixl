@@ -93,7 +93,7 @@
 #   SPDK_ROOT   Path to an SPDK tree whose scripts/setup.sh binds the device.
 #               Required only when BIND=1; no default. (With BIND=0 the device
 #               is assumed already bound to vfio-pci and SPDK_ROOT is unused.)
-#   TEST_BIN    Path to the built spdk_kv_block_roundtrip_test binary.
+#   TEST_BIN    Path to the built spdk_block_roundtrip_test binary.
 #   BIND        1 => run the scoped `sudo env ... setup.sh` bind before testing.
 #               Default 0 (assume the device is already bound to vfio-pci).
 #   FORCE       1 => proceed even when the device carries an existing filesystem
@@ -127,14 +127,14 @@ if [[ "$PCI_BDF" != *:*:* ]]; then
 fi
 
 SPDK_ROOT="${SPDK_ROOT:-}"
-TEST_BIN="${TEST_BIN:-$here/../../../builddir/src/plugins/spdk_kv/spdk_kv_block_roundtrip_test}"
+TEST_BIN="${TEST_BIN:-$here/../../../builddir/src/plugins/spdk/spdk_block_roundtrip_test}"
 BIND="${BIND:-0}"
 FORCE="${FORCE:-0}"
 ASSUME_YES="${ASSUME_YES:-0}"
 
 if [[ ! -x "$TEST_BIN" ]]; then
     echo "error: test binary not found/executable: $TEST_BIN" >&2
-    echo "       build it with: ninja -C builddir src/plugins/spdk_kv/spdk_kv_block_roundtrip_test" >&2
+    echo "       build it with: ninja -C builddir src/plugins/spdk/spdk_block_roundtrip_test" >&2
     exit 1
 fi
 TEST_BIN="$(readlink -f "$TEST_BIN")"

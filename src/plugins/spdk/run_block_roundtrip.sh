@@ -20,7 +20,7 @@
 #              namespace RPCs (bdev_malloc_create / nvmf_subsystem_add_ns). NOTE:
 #              the host-side SPDK build the plugin links against may lack a built
 #              nvmf_tgt; point SPDK_ROOT at a target-capable build in that case.
-#   TEST_BIN   path to the built spdk_kv_block_roundtrip_test binary
+#   TEST_BIN   path to the built spdk_block_roundtrip_test binary
 #   BLOCK_SIZE malloc bdev logical block size in bytes (default 512)
 #   DEV_SIZE_MB malloc bdev size in MiB (default 128, so a ~60 MiB write fits)
 set -euo pipefail
@@ -29,7 +29,7 @@ if [[ -z "${SPDK_ROOT:-}" ]]; then
     echo "error: SPDK_ROOT must be set to a target-capable SPDK build" >&2
     exit 1
 fi
-TEST_BIN="${TEST_BIN:-$(dirname "$0")/../../../builddir/src/plugins/spdk_kv/spdk_kv_block_roundtrip_test}"
+TEST_BIN="${TEST_BIN:-$(dirname "$0")/../../../builddir/src/plugins/spdk/spdk_block_roundtrip_test}"
 TEST_BIN="$(readlink -f "$TEST_BIN")"
 BLOCK_SIZE="${BLOCK_SIZE:-512}"
 DEV_SIZE_MB="${DEV_SIZE_MB:-128}"

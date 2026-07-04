@@ -35,8 +35,8 @@
  *     twins (verify / verifyDirect) collapse into one function each.
  */
 
-#ifndef SPDK_KV_TEST_COMMON_H
-#define SPDK_KV_TEST_COMMON_H
+#ifndef SPDK_TEST_COMMON_H
+#define SPDK_TEST_COMMON_H
 
 #include <cstdint>
 #include <cstring>
@@ -47,18 +47,18 @@
 
 #include "nixl_descriptors.h"
 #include "backend/backend_aux.h"
-#include "spdk_kv_backend.h"
+#include "spdk_backend.h"
 
 extern "C" {
-#include "spdk_kv_shim.h" // SPDK_KV_SHIM_MAX_VALUE_LEN, dma_alloc/free, ...
+#include "spdk_shim.h" // SPDK_SHIM_MAX_VALUE_LEN, dma_alloc/free, ...
 }
 
-namespace spdk_kv_test {
+namespace spdk_test {
 
 // Poll a synchronous shim op to completion. Shim ops complete inline, so checkXfer
 // should report SUCCESS immediately; IN_PROG is tolerated for a bounded spin.
 inline bool
-checkComplete(const nixlSpdkKvEngine &eng, nixlBackendReqH *h) {
+checkComplete(const nixlSpdkEngine &eng, nixlBackendReqH *h) {
     for (int i = 0; i < 1000; ++i) {
         nixl_status_t s = eng.checkXfer(h);
         if (s == NIXL_SUCCESS) return true;
@@ -76,7 +76,7 @@ checkComplete(const nixlSpdkKvEngine &eng, nixlBackendReqH *h) {
 // (SUCCESS/IN_PROG), and the op polled to SUCCESS. Not for the reject/mismatch
 // cases (which inspect prep/post/check statuses individually).
 inline bool
-doXfer(const nixlSpdkKvEngine &eng, nixl_xfer_op_t op, const nixl_meta_dlist_t &local,
+doXfer(const nixlSpdkEngine &eng, nixl_xfer_op_t op, const nixl_meta_dlist_t &local,
        const nixl_meta_dlist_t &remote, const std::string &agent) {
     nixlBackendReqH *h = nullptr;
     if (eng.prepXfer(op, local, remote, agent, h) != NIXL_SUCCESS) return false;
@@ -92,7 +92,7 @@ doXfer(const nixlSpdkKvEngine &eng, nixl_xfer_op_t op, const nixl_meta_dlist_t &
 // standalone test owns no host SPDK env. Returns nullptr on init error (the
 // engine ctor has already logged the reason, e.g. the -ENOTSUP metadata refusal);
 // the caller prints its own FAIL line and exits non-zero.
-inline std::unique_ptr<nixlSpdkKvEngine>
+inline std::unique_ptr<nixlSpdkEngine>
 makeEngine(const std::string &arg, const char *agent, bool block) {
     nixl_b_params_t params;
     if (arg.find("trtype:") != std::string::npos) {
@@ -111,13 +111,13 @@ makeEngine(const std::string &arg, const char *agent, bool block) {
     init.pthrDelay = 0;
     init.enableTelemetry_ = false;
 
-    auto eng = std::make_unique<nixlSpdkKvEngine>(&init);
+    auto eng = std::make_unique<nixlSpdkEngine>(&init);
     if (eng->getInitErr()) return nullptr;
     return eng;
 }
 
 // A value buffer for a round-trip: Heap (std::vector -> ordinary DRAM, staged
-// path) or Dma (spdk_kv_shim_dma_alloc -> fd-backed, zero-copy path). Frees
+// path) or Dma (spdk_shim_dma_alloc -> fd-backed, zero-copy path). Frees
 // through the matching deallocator.
 enum class BufKind { Heap, Dma };
 
@@ -128,11 +128,11 @@ public:
             heap_.assign(len_, 0);
             ptr_ = heap_.data();
         } else {
-            ptr_ = spdk_kv_shim_dma_alloc(len_);
+            ptr_ = spdk_shim_dma_alloc(len_);
         }
     }
     ~ValueBuf() {
-        if (kind_ == BufKind::Dma) spdk_kv_shim_dma_free(ptr_);
+        if (kind_ == BufKind::Dma) spdk_shim_dma_free(ptr_);
     }
     ValueBuf(const ValueBuf &) = delete;
     ValueBuf &operator=(const ValueBuf &) = delete;
@@ -154,7 +154,7 @@ private:
 // zero-copy datapath (dramIsDmaRegistered on both DRAM buffers). Exercises the
 // region-bounded SGL across sizes that span several 2 MiB DMA regions.
 inline bool
-storeRetrieveVerify(nixlSpdkKvEngine &eng, const std::string &agent, const std::string &key,
+storeRetrieveVerify(nixlSpdkEngine &eng, const std::string &agent, const std::string &key,
                     size_t size, BufKind kind = BufKind::Heap, bool expect_direct = false) {
     ValueBuf src(kind, size), dst(kind, size);
     if (!src.valid() || !dst.valid()) {
@@ -214,7 +214,7 @@ storeRetrieveVerify(nixlSpdkKvEngine &eng, const std::string &agent, const std::
 // compare. `kind`/`expect_direct` behave as in storeRetrieveVerify (Dma+direct
 // asserts the zero-copy block datapath).
 inline bool
-writeReadVerify(nixlSpdkKvEngine &eng, const std::string &agent, uint64_t lba, size_t size,
+writeReadVerify(nixlSpdkEngine &eng, const std::string &agent, uint64_t lba, size_t size,
                 BufKind kind = BufKind::Heap, bool expect_direct = false) {
     ValueBuf src(kind, size), dst(kind, size);
     if (!src.valid() || !dst.valid()) {
@@ -268,6 +268,6 @@ writeReadVerify(nixlSpdkKvEngine &eng, const std::string &agent, uint64_t lba, s
     return ok;
 }
 
-} // namespace spdk_kv_test
+} // namespace spdk_test
 
-#endif // SPDK_KV_TEST_COMMON_H
+#endif // SPDK_TEST_COMMON_H

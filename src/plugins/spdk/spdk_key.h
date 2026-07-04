@@ -15,8 +15,8 @@
  * limitations under the License.
  */
 
-#ifndef SPDK_KV_KEY_H
-#define SPDK_KV_KEY_H
+#ifndef SPDK_KEY_H
+#define SPDK_KEY_H
 
 #include <cstdint>
 #include <string>
@@ -44,4 +44,4 @@
 bool
 spdkKvKeyFromBlobId(const std::string &block_id, uint8_t max_key_len, std::vector<uint8_t> &out);
 
-#endif // SPDK_KV_KEY_H
+#endif // SPDK_KEY_H

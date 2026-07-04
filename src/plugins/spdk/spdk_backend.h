@@ -15,22 +15,22 @@
  * limitations under the License.
  */
 
-#ifndef SPDK_KV_BACKEND_H
-#define SPDK_KV_BACKEND_H
+#ifndef SPDK_BACKEND_H
+#define SPDK_BACKEND_H
 
 #include <cstdint>
 #include <string>
 #include <vector>
 
 #include "backend/backend_engine.h"
-#include "spdk_kv_key.h" // spdkKvKeyFromBlobId (SPDK-free key mapping)
+#include "spdk_key.h" // spdkKvKeyFromBlobId (SPDK-free key mapping)
 #include "sync.h" // nixlLock / NIXL_LOCK_GUARD (built from init_params->syncMode)
 
 // Forward declaration of the opaque SPDK KV shim handle (C ABI).
-struct spdk_kv_shim;
+struct spdk_shim;
 
 /**
- * nixlSpdkKvEngine: a clean-sheet, transport-agnostic, backend-agnostic NIXL
+ * nixlSpdkEngine: a clean-sheet, transport-agnostic, backend-agnostic NIXL
  * backend that speaks the ratified NVMe Key-Value command set over the SPDK
  * NVMe driver (lib/nvme). It works against ANY SPDK NVMe-KV target (an
  * in-memory kvdev, a librados-backed kvdev, a DPU-presented VF, ...); it
@@ -91,7 +91,7 @@ struct spdk_kv_shim;
  * Zero-copy datapath, with a staging fallback (DOCUMENTED):
  *   Store/Retrieve/read/write DMA to/from the value buffer, so it must be
  *   DMA-reachable by the shim's transport. registerMem() asks the shim to make
- *   the caller's DRAM reachable (spdk_kv_shim_mem_register); when it is, postXfer
+ *   the caller's DRAM reachable (spdk_shim_mem_register); when it is, postXfer
  *   hands the caller's buffer straight to the shim -- NO copy:
  *     - WRITE: Store/write(key/lba, user DRAM)
  *     - READ : Retrieve/read(key/lba, user DRAM)   (device DMAs into user DRAM)
@@ -103,15 +103,15 @@ struct spdk_kv_shim;
  *   it). For an unreachable region the engine
  *   FALLS BACK to staging through a per-request shim DMA buffer and copies
  *   (memcpy user<->DMA around the op). Both the direct and staged buffers are
- *   described to the device by the SAME region-bounded SGL (see spdk_kv_shim),
+ *   described to the device by the SAME region-bounded SGL (see spdk_shim),
  *   so large values work either way. The fallback is always correct -- just a
  *   copy; dramIsDmaRegistered() reports which path a region took. Registering a
  *   GPU/VRAM dma-buf directly (P2PDMA) is a later extension of this same hook.
  */
-class nixlSpdkKvEngine : public nixlBackendEngine {
+class nixlSpdkEngine : public nixlBackendEngine {
 public:
-    explicit nixlSpdkKvEngine(const nixlBackendInitParams *init_params);
-    ~nixlSpdkKvEngine() override;
+    explicit nixlSpdkEngine(const nixlBackendInitParams *init_params);
+    ~nixlSpdkEngine() override;
 
     bool
     supportsRemote() const override {
@@ -204,7 +204,7 @@ public:
 
     // Logical block (sector) size in bytes of the bound block namespace, or 0
     // when this engine is not block-bound (no shim / KV mode). Read-only
-    // accessor over the shim's spdk_kv_shim_sector_size(); lets a caller map a
+    // accessor over the shim's spdk_shim_sector_size(); lets a caller map a
     // block byte offset to its LBA (offset / sectorSize). Does not touch the
     // datapath or any transfer state.
     uint32_t
@@ -244,8 +244,8 @@ private:
 
     // postXferBlock: issue the prepXfer-validated LBA ranges (carried on the
     // request handle) -- stage through a region-aligned SPDK DMA buffer, or DMA
-    // straight to/from the caller's buffer, then spdk_kv_shim_write (WRITE) /
-    // spdk_kv_shim_read (READ) per descriptor. No range recompute.
+    // straight to/from the caller's buffer, then spdk_shim_write (WRITE) /
+    // spdk_shim_read (READ) per descriptor. No range recompute.
     nixl_status_t
     postXferBlock(const nixl_xfer_op_t &operation,
                   const nixl_meta_dlist_t &local,
@@ -268,14 +268,14 @@ private:
     void stagingRelease(void *buf) const;
 
     // The SPDK KV shim handle (owns the controller attach + qpair).
-    spdk_kv_shim *shim_ = nullptr;
+    spdk_shim *shim_ = nullptr;
 
     // Lazily-grown, reused STAGING buffer + its capacity for the staged-copy
     // fallback. The engine is single-threaded and the shim polls each op to
     // completion before returning, so at most ONE shim op is in flight at a time
     // -- one staging buffer therefore serves every descriptor and every post,
     // replacing the per-descriptor alloc+free. Grown on demand and freed exactly
-    // once in the dtor (before spdk_kv_shim_close()). POISON INVARIANT: the cache
+    // once in the dtor (before spdk_shim_close()). POISON INVARIANT: the cache
     // only ever holds a buffer whose last op completed cleanly; a poisoned op's
     // buffer is transferred to the shim's quarantine and the cache is NULLed
     // (stagingRelease), so it can never be recycled and is freed once at the
@@ -309,4 +309,4 @@ private:
     mutable nixlLock shim_lock_;
 };
 
-#endif // SPDK_KV_BACKEND_H
+#endif // SPDK_BACKEND_H

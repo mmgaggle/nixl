@@ -24,7 +24,7 @@
 #   SPDK_ROOT  (required) path to a target-capable SPDK build providing a built
 #              build/bin/nvmf_tgt whose bdev_malloc_create supports the metadata
 #              options (--md-size / --md-interleave).
-#   TEST_BIN   path to the built spdk_kv_block_roundtrip_test binary
+#   TEST_BIN   path to the built spdk_block_roundtrip_test binary
 #   BLOCK_SIZE malloc bdev data block size in bytes (default 512)
 #   MD_SIZE    malloc bdev metadata size in bytes (default 8; must be > 0)
 #   DEV_SIZE_MB malloc bdev size in MiB (default 64)
@@ -34,7 +34,7 @@ if [[ -z "${SPDK_ROOT:-}" ]]; then
     echo "error: SPDK_ROOT must be set to a target-capable SPDK build" >&2
     exit 1
 fi
-TEST_BIN="${TEST_BIN:-$(dirname "$0")/../../../builddir/src/plugins/spdk_kv/spdk_kv_block_roundtrip_test}"
+TEST_BIN="${TEST_BIN:-$(dirname "$0")/../../../builddir/src/plugins/spdk/spdk_block_roundtrip_test}"
 TEST_BIN="$(readlink -f "$TEST_BIN")"
 BLOCK_SIZE="${BLOCK_SIZE:-512}"
 MD_SIZE="${MD_SIZE:-8}"
