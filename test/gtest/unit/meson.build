@@ -23,6 +23,15 @@ if is_variable('obj_backend_interface')
     unit_test_deps += [obj_unit_test_dep]
 endif
 
+# the libfabric token provider needs ofi-rma, not the AWS SDK
+if is_variable('obj_rdma_token_dep')
+    unit_test_deps += [declare_dependency(
+        sources: files('obj/ofi_token_provider.cpp'),
+        include_directories: [nixl_inc_dirs, utils_inc_dirs],
+        dependencies: [obj_rdma_token_dep],
+    )]
+endif
+
 if is_variable('redis_backend_interface')
     subdir('redis')
     unit_test_deps += [redis_unit_test_dep]

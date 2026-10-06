@@ -13,6 +13,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Token providers for the S3-over-RDMA data path. They need no AWS SDK, so
+# they build and test on their own. The libfabric provider (ofi1 tokens)
+# needs ofi-rma; ofi_hmem=auto picks the GPU memory type of this build.
+if ofi_rma_dep.found()
+    ofi_hmem_default = 'none'
+    if not is_disabler(rocm_dep)
+        if rocm_dep.found()
+            ofi_hmem_default = 'rocr'
+        endif
+    endif
+    if ofi_hmem_default == 'none' and cuda_dep.found()
+        ofi_hmem_default = 'cuda'
+    endif
+    obj_rdma_token_lib = static_library('obj_rdma_token',
+        ['rdma/token_provider.h', 'rdma/ofi_token_provider.h', 'rdma/ofi_token_provider.cpp'],
+        include_directories: [nixl_inc_dirs, utils_inc_dirs],
+        dependencies: [nixl_common_dep, ofi_rma_dep, dl_dep],
+        cpp_args: ['-DNIXL_OFI_HMEM_DEFAULT="' + ofi_hmem_default + '"'],
+        pic: true,
+        install: false)
+    obj_rdma_token_dep = declare_dependency(
+        link_with: obj_rdma_token_lib,
+        include_directories: [include_directories('.')],
+        dependencies: [nixl_common_dep, ofi_rma_dep, dl_dep])
+    summary({'ofi1 tokens (OBJ S3-over-RDMA)': 'ofi-rma, ofi_hmem=auto is ' + ofi_hmem_default},
+            section: 'Dependencies')
+endif
+
 # Check for AWS SDK dependencies for S3 utilities
 aws_s3 = dependency('aws-cpp-sdk-s3', static: false, required: false)
 aws_s3_crt = dependency('aws-cpp-sdk-s3-crt', static: false, required: false)
@@ -34,7 +62,7 @@ if aws_s3.found() and aws_s3_crt.found() and aws_core.found()
     # (not in the OBJ plugin) so the accel engines — and any future vendor
     # engine — can compose them.
     obj_utils_sources = ['s3/utils.cpp', 's3/utils.h',
-                         'rdma/rdma_protocol.h']
+                         'rdma/rdma_protocol.h', 'rdma/token_provider.h']
     obj_utils_deps = [nixl_common_dep, partial_aws_s3, partial_aws_s3_crt, partial_aws_core]
     if cuobj_dep.found()
         obj_utils_sources += ['rdma/rdma.h',
