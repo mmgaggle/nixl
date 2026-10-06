@@ -23,12 +23,18 @@ if is_variable('obj_backend_interface')
     unit_test_deps += [obj_unit_test_dep]
 endif
 
-# the libfabric token provider needs ofi-rma, not the AWS SDK
+# The libfabric token provider needs ofi-rma, not the AWS SDK. With the SDK,
+# obj_utils holds it, so the test links that rather than a second copy.
 if is_variable('obj_rdma_token_dep')
+    if is_variable('obj_utils_interface')
+        ofi_token_test_dep = obj_utils_interface
+    else
+        ofi_token_test_dep = obj_rdma_token_dep
+    endif
     unit_test_deps += [declare_dependency(
         sources: files('obj/ofi_token_provider.cpp'),
         include_directories: [nixl_inc_dirs, utils_inc_dirs],
-        dependencies: [obj_rdma_token_dep],
+        dependencies: [ofi_token_test_dep],
     )]
 endif
 

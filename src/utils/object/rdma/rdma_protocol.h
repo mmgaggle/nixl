@@ -20,6 +20,7 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -92,6 +93,70 @@ parseRdmaReply(const std::string &reply) {
         return 0;
     }
     return value;
+}
+
+/** @brief How a control-plane GET ended. */
+enum class get_outcome {
+    rdma, ///< the server wrote the range out of band
+    http_body, ///< the server declined RDMA and sent the range in the body
+    declined, ///< the server declined RDMA, and the caller kept no body
+    error, ///< any other response
+};
+
+/** @brief The outcome of a control-plane GET, and the bytes it delivered. */
+struct getReplyClass {
+    get_outcome outcome = get_outcome::error;
+    uint64_t bytes = 0;
+};
+
+/**
+ * @brief Decide the outcome of a control-plane GET from its response.
+ *
+ * Out of band, the HTTP status and x-amz-rdma-reply must agree: 200 with 200
+ * for a whole object, 206 with 206 for a range. A reply of 501, or none (a
+ * server that does not know the token), is a decline. After a decline, a
+ * caller that kept the body (rdma_http_fallback) has the data from the body.
+ * @param http_status The status code of the response.
+ * @param reply x-amz-rdma-reply, empty when the header is absent.
+ * @param bytes_transferred x-amz-rdma-bytes-transferred, empty when absent.
+ *        The server sends it only for a transfer of more than 0 bytes.
+ * @param requested The size of the range the request asked for.
+ * @param body_bytes The size of the body the caller kept, or nullopt when it
+ *        kept none.
+ */
+[[nodiscard]] inline getReplyClass
+classifyGetReply(int http_status,
+                 const std::string &reply,
+                 const std::string &bytes_transferred,
+                 uint64_t requested,
+                 std::optional<uint64_t> body_bytes) {
+    const bool ok_status = http_status == 200 || http_status == 206;
+    const int code = parseRdmaReply(reply);
+    if (code == static_cast<int>(rdma_not_supported)) {
+        if (!ok_status) {
+            return {get_outcome::error, 0};
+        }
+        if (body_bytes.has_value() && *body_bytes <= requested) {
+            return {get_outcome::http_body, *body_bytes};
+        }
+        return {get_outcome::declined, 0};
+    }
+    const bool accepted = (http_status == 200 && code == rdma_reply_success) ||
+        (http_status == 206 && code == rdma_reply_partial_content);
+    if (!accepted) {
+        return {get_outcome::error, 0};
+    }
+    if (bytes_transferred.empty()) {
+        return {get_outcome::rdma, 0};
+    }
+    uint64_t n = 0;
+    const char *begin = bytes_transferred.data();
+    const char *end = begin + bytes_transferred.size();
+    auto [parsed_end, ec] = std::from_chars(begin, end, n);
+    if (ec != std::errc{} || parsed_end != end || n > requested) {
+        return {get_outcome::error, 0};
+    }
+    return {get_outcome::rdma, n};
 }
 
 } // namespace nixl_obj_rdma

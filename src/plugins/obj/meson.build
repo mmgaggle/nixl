@@ -40,21 +40,31 @@ plugin_deps = [nixl_infra, nixl_common_dep, obj_utils_interface, dependency('asi
 compile_defs = []
 compile_flags = []
 
-if cuobj_dep.found()
-    message('Found CUObjClient Library. Enabling S3 Accelerated engines')
+# The generic accelerated engine needs a token provider: cuObject or ofi-rma.
+# The Dell engine needs cuObject.
+if cuobj_dep.found() or ofi_rma_dep.found()
+    message('Found a token provider (cuObject or ofi-rma). Enabling the S3 Accelerated engine')
     obj_sources += [
         's3_accel/client.cpp',
         's3_accel/client.h',
         's3_accel/engine_impl.cpp',
         's3_accel/engine_impl.h',
+    ]
+else
+    message('Found neither cuObject nor ofi-rma. Skipping S3 Accelerated engines')
+endif
+if cuobj_dep.found()
+    message('Found CUObjClient Library. Enabling the Dell ObjectScale engine')
+    obj_sources += [
         's3_accel/dell/client.cpp',
         's3_accel/dell/client.h',
         's3_accel/dell/engine_impl.cpp',
         's3_accel/dell/engine_impl.h',
     ]
     plugin_deps += [ cuobj_dep ]
-else
-    message('Could not find CUObjClient Library. Skipping S3 Accelerated engines')
+endif
+if ofi_rma_dep.found()
+    plugin_deps += [ ofi_rma_dep ]
 endif
 
 if 'OBJ' in static_plugins

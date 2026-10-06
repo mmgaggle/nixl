@@ -24,13 +24,13 @@
 using obj_plugin_t = nixlBackendPluginCreator<nixlObjEngine>;
 
 // VRAM_SEG is served only by the accelerated (S3-over-RDMA) engine, which is
-// compiled in only when cuObject is present, so advertise it on the same
-// condition. Whether a given engine actually accepts VRAM is decided at run
-// time by S3AccelObjEngineImpl::getSupportedMems().
+// compiled in only when a token provider is present (cuObject or ofi-rma), so
+// advertise it on the same condition. Whether a given engine actually accepts
+// VRAM is decided at run time by S3AccelObjEngineImpl::getSupportedMems().
 static const nixl_mem_list_t supported_segments = {
     DRAM_SEG,
     OBJ_SEG,
-#ifdef HAVE_CUOBJ_CLIENT
+#if defined(HAVE_CUOBJ_CLIENT) || defined(HAVE_OFI_RMA)
     VRAM_SEG,
 #endif
 };

@@ -11,6 +11,7 @@
 // only component that touches the AWS SDK's low-level HTTP/signing layer; the
 // wire-protocol helpers it builds on are in rdma_protocol.h (SDK-free).
 
+#include "control_plane.h"
 #include "rdma_protocol.h"
 
 #include <cstdint>
@@ -23,23 +24,6 @@
 
 namespace nixl_obj_rdma {
 
-// S3 multipart upload caps a single upload at 10000 parts, so a part number is
-// valid only in 1..s3_max_multipart_part_number.
-inline constexpr uint32_t s3_max_multipart_part_number = 10000;
-
-/**
- * @brief Per-call context for an RDMA PUT/GET control-plane request.
- *
- * Region and credentials live in the control plane's signer, not here.
- */
-struct S3RdmaClientCtx {
-    std::string bucket; ///< Target bucket.
-    std::string object; ///< Object key.
-    std::string uploadId; ///< Multipart upload id; empty for single-shot.
-    uint32_t partNumber = 0; ///< Part number 1..10000 when uploadId is set.
-    std::string etag; ///< ETag returned by the server; populated on success.
-};
-
 /**
  * @brief S3 RDMA control plane.
  *
@@ -49,17 +33,20 @@ struct S3RdmaClientCtx {
  * low-level HTTP layer; it is deliberately narrow so the protocol logic around
  * it stays SDK-agnostic and testable.
  */
-class S3RdmaControlPlane {
+class S3RdmaControlPlane : public iS3RdmaControlPlane {
 public:
     /**
      * @brief Build the control plane from backend params.
      *
      * Resolves the endpoint, region, and credentials. On failure, valid()
-     * returns false and the instance is unusable.
+     * returns false and the instance is unusable. `rdma_request_timeout_ms`
+     * sets the request timeout (default 10000). A server that relays a GET
+     * back over HTTP, as Ceph RGW does after waiting out an OSD lease, can
+     * need longer.
      * @param custom_params Backend key-value params; may be nullptr.
      */
     explicit S3RdmaControlPlane(const nixl_b_params_t *custom_params);
-    ~S3RdmaControlPlane();
+    ~S3RdmaControlPlane() override;
 
     /**
      * @brief Whether the control plane initialized successfully.
@@ -80,7 +67,7 @@ public:
      *         server declined, or rdma_error on transport failure.
      */
     [[nodiscard]] ssize_t
-    rdmaPut(S3RdmaClientCtx &ctx, const char *token, uint64_t size);
+    rdmaPut(S3RdmaClientCtx &ctx, const char *token, uint64_t size) override;
 
     /**
      * @brief Issue the signed control-plane GET carrying the RDMA token.
@@ -88,13 +75,16 @@ public:
      * @param token RDMA descriptor (carries the buffer address and size in its
      *        own leading fields; sent verbatim as x-amz-rdma-token).
      * @param size Number of bytes to fetch.
-     * @param offset Byte offset into the object; a byte-range request is made
-     *        (server replies 206) when it is non-zero.
-     * @return Bytes transferred (>0), rdma_not_supported if declined, or
+     * @param offset Byte offset into the object. The request always carries
+     *        a byte range, so a server answers 206 with x-amz-rdma-reply: 206.
+     * @param body_dst Host memory for the body of a declined GET, or nullptr.
+     *        See iS3RdmaControlPlane::rdmaGet().
+     * @return Bytes delivered (>=0), rdma_not_supported if declined, or
      *         rdma_error on failure.
      */
     [[nodiscard]] ssize_t
-    rdmaGet(S3RdmaClientCtx &ctx, const char *token, uint64_t size, uint64_t offset);
+    rdmaGet(S3RdmaClientCtx &ctx, const char *token, uint64_t size, uint64_t offset, void *body_dst)
+        override;
 
 private:
     struct Impl;

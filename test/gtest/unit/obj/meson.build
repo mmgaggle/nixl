@@ -15,6 +15,11 @@
 
 obj_test_sources = ['obj.cpp', 'rdma_protocol.cpp']
 
+# the retry wrappers are built with either token provider
+if cuobj_dep.found() or ofi_rma_dep.found()
+    obj_test_sources += ['rdma_retry.cpp']
+endif
+
 if cuobj_dep.found()
     obj_test_sources += ['mock_dell_s3_client.cpp', 'obj_cuobj.cpp']
 endif
@@ -27,6 +32,7 @@ obj_unit_test_dep = declare_dependency(
     ],
     dependencies: [
         obj_backend_interface,
+        obj_utils_interface,
         dependency('asio', required: true),
     ],
 )

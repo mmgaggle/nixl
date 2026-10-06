@@ -15,8 +15,10 @@
  *
  * It composes the shared RDMA transport through awsS3AccelClient and owns the
  * accel-layer concerns that the plain HTTP base must not carry: it advertises
- * VRAM_SEG, and pins/unpins DRAM and VRAM buffers for RDMA in registerMem/
- * deregisterMem. The base DefaultObjEngineImpl is unchanged.
+ * VRAM_SEG when the client's token provider (cuObject or libfabric, see
+ * `rdma_transport`) can register GPU memory, and registers DRAM and VRAM
+ * buffers with that provider in registerMem/deregisterMem. The base
+ * DefaultObjEngineImpl is unchanged.
  */
 class S3AccelObjEngineImpl : public DefaultObjEngineImpl {
 public:
@@ -39,11 +41,15 @@ protected:
 private:
     // True iff the current client is an accelerated client whose generic
     // S3-over-RDMA fast path is fully ready. Gates VRAM advertisement and buffer
-    // pinning. False for an injected non-accel client (e.g. a test mock, which is
-    // not an awsS3AccelClient). Named to avoid clashing with the client's own
-    // rdmaReady().
+    // registration. False for an injected non-accel client (e.g. a test mock,
+    // which is not an awsS3AccelClient). Named to avoid clashing with the
+    // client's own rdmaReady().
     [[nodiscard]] bool
     rdmaEngReady() const;
+
+    // The fast path's token provider when rdmaEngReady(), else nullptr.
+    [[nodiscard]] std::shared_ptr<nixl_obj_rdma::iRdmaTokenProvider>
+    rdmaTokens() const;
 };
 
 #endif // OBJ_PLUGIN_S3_ACCEL_ENGINE_IMPL_H

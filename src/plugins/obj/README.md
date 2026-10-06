@@ -42,11 +42,11 @@ git clone --recurse-submodules https://github.com/aws/aws-sdk-cpp.git --branch 1
 
 ### Optional Dependencies
 
-**S3 Accelerated Engines** (`cuobjclient-13.1`): Required for GPU-direct and accelerated object storage operations. When available, enables:
-- `S3AccelObjEngineImpl` - Base accelerated S3 engine
-- Vendor-specific accelerated implementations under `s3_accel/`
+**S3 Accelerated Engines**: GPU-direct and accelerated object storage operations need a token provider, one of these:
+- `cuobjclient-13.1`: NVIDIA cuObject. It mints cuObject DC descriptors and enables the vendor-specific engines under `s3_accel/`, such as Dell ObjectScale.
+- [ofi-rma](https://github.com/mmgaggle/ofi-rma) (Meson option `ofi_rma`, found installed or built from `subprojects/ofi-rma.wrap`): libfabric `ofi1` tokens, which Ceph RGW forwards to its OSDs. It runs over any libfabric provider, for example `verbs;ofi_rxm` or a UET provider.
 
-If `cuobjclient-13.1` is not found during build, the S3 Accelerated engines will be automatically disabled, and the plugin will fall back to standard S3 and S3 CRT engines.
+With either one, the build enables `S3AccelObjEngineImpl`, the generic accelerated S3 engine. If neither is found, the S3 Accelerated engines are disabled, and the plugin uses the standard S3 and S3 CRT engines.
 
 ## Configuration
 
@@ -73,6 +73,15 @@ Backend parameters are passed as a key-value map (`nixl_b_params_t`) when creati
 | `throughput_target_gbps` | Target throughput for the S3 CRT client in **whole Gbps** (integer); sizes its parallel connection count | `10` | No |
 | `accelerated` | Enable S3 Accelerated engine (`true`/`false`) | `false` | No |
 | `type` | Accelerated engine type (`dell`, etc.) | - | No |
+| `rdma_transport` | Token type of the generic accelerated engine: `cuobj` or `ofi` | `cuobj` with cuObject, else `ofi` | No |
+| `ofi_provider` | libfabric provider for `ofi`, the same as the OSDs' `osd_ofi_provider` | - | With `ofi` |
+| `ofi_domain` | libfabric domain: an RDMA device or a network interface | provider's choice | No |
+| `ofi_node` | Local address of the libfabric endpoint. The OSDs must reach it | provider's choice | No |
+| `ofi_service` | Local port of the libfabric endpoint | provider's choice | No |
+| `ofi_hmem` | GPU memory type for `VRAM_SEG` with `ofi`: `none`, `cuda`, `rocr`, `ze`, or `auto` | `auto` | No |
+| `rdma_http_fallback` | Accept the body of a GET that the server declines (`true`/`false`). Host memory only | `false` | No |
+| `rdma_fence_ms` | After a GET with no response, wait this long after the request before reporting the failure | `10000` with `ofi`, `0` with `cuobj` | No |
+| `rdma_request_timeout_ms` | Timeout of the S3-over-RDMA control-plane request | `10000` | No |
 
 \* If `access_key` and `secret_key` are not provided, the AWS SDK will attempt to use default credential providers (IAM roles, environment variables, credential files, etc.)
 
@@ -219,6 +228,26 @@ This configuration automatically uses the high-performance S3 CRT client for obj
 
 > **Part size and the 5 MiB floor**: AWS S3 requires a minimum part size of 5 MiB for all parts except the last. If `crtMinLimit` is set below 5 MiB, the CRT SDK silently clamps the part size to 5 MiB (logging a warning) while still triggering multipart at `crtMinLimit`. Objects smaller than 5 MiB are uploaded as a single-part multipart request, which S3 permits. The 5 MiB minimum is an AWS service constraint and cannot be bypassed. To avoid the silent clamp, use `crtMinLimit >= 5242880` (5 MiB).
 
+#### S3 over RDMA with libfabric (Ceph RGW)
+
+Ceph RGW with OSD passthrough (`rgw_rdma_osd_passthrough`) forwards the `ofi1` token of a GET to its OSDs, and each OSD writes its stripes straight into the client's buffer. The OSDs and the client must run the same libfabric provider:
+
+```cpp
+nixl_b_params_t params = {
+    {"bucket", "models"},
+    {"endpoint_override", "http://rgw.example.com:8000"},
+    {"scheme", "http"},
+    {"accelerated", "true"},
+    {"rdma_transport", "ofi"},
+    {"ofi_provider", "verbs;ofi_rxm"},  // the OSDs' osd_ofi_provider
+    {"ofi_domain", "mlx5_0"},
+    {"ofi_node", "10.0.0.5"},           // the OSDs write to this address
+    {"ofi_hmem", "rocr"}                // VRAM_SEG on AMD GPUs
+};
+```
+
+For GPU memory, libfabric must be built with the GPU runtime (for example `--with-rocr`), and its provider must offer `FI_HMEM`. The engine lends ROCm memory as a dma-buf that the ROCr runtime exports, so it needs no kernel built with `CONFIG_DMABUF_MOVE_NOTIFY`. With the verbs provider, set `FI_MR_CACHE_MONITOR=disabled`. Otherwise the registration cache can keep a deregistered buffer's key valid, and an old token can still write into that memory.
+
 ## Transfer Operations
 
 The Object Storage backend supports read and write operations between local memory and S3 objects. Here are the key aspects of transfer operations:
@@ -327,13 +356,15 @@ Each engine implementation defines its own supported memory segment types via `g
 | `S3AccelObjEngineImpl` | `OBJ_SEG`, `DRAM_SEG`, `VRAM_SEG` | Generic S3-over-RDMA - advertises `VRAM_SEG` when the RDMA fast path is ready |
 | Vendor engines | `OBJ_SEG`, `DRAM_SEG`, `VRAM_SEG` | Vendor-specific - override to add GPU support |
 
-**Important:** `S3AccelObjEngineImpl` advertises `VRAM_SEG` only when the generic S3-over-RDMA fast path is ready (cuObject fabric + control plane). Under `accelerated=true` there is no HTTP fallback: the backend fails to initialize if the fast path is unavailable, and a transfer the server declines is a hard error. `putObjectAsync` rejects a non-zero offset (a single-shot RDMA PUT writes the whole object); `getObjectAsync` honours the offset as a ranged read.
+**Important:** `S3AccelObjEngineImpl` advertises `VRAM_SEG` only when the generic S3-over-RDMA fast path is ready (a token provider and the control plane) and the token provider can register GPU memory. Under `accelerated=true` there is no silent HTTP fallback: the backend fails to initialize if the fast path is unavailable, and a transfer the server declines is a hard error. A GET into host memory can opt in to the body of a declined GET with `rdma_http_fallback=true`. `putObjectAsync` rejects a non-zero offset (a single-shot RDMA PUT writes the whole object); `getObjectAsync` honours the offset as a ranged read.
+
+With `rdma_transport=ofi`, the server reads the payload of a PUT over HTTP, so a PUT from host memory is a plain S3 PUT, and a PUT from GPU memory fails. A GET is a ranged GET with an `ofi1` token for the part of the registered buffer that the descriptor names.
 
 ### Adding a Vendor Implementation
 
 > **⚠️ Important: Conditional Compilation for S3 Accelerated Engines**
 >
-> The S3 Accelerated path (`s3_accel`) and any vendor implementations under it require the `cuobjclient-13.1` library. When adding new extensions to `s3_accel`:
+> The generic S3 Accelerated engine (`s3_accel`) needs a token provider (`cuobjclient-13.1` or ofi-rma). The vendor implementations under it use the cuObject API directly, so they require the `cuobjclient-13.1` library. When adding new extensions to `s3_accel`:
 >
 >
 > Vendor engines self-register via `objAccelEngineRegistrar`

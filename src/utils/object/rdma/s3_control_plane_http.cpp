@@ -25,9 +25,11 @@
 #include <aws/core/utils/DateTime.h>
 #include <aws/core/utils/HashingUtils.h>
 #include <aws/core/utils/StringUtils.h>
+#include <aws/core/utils/stream/PreallocatedStreamBuf.h>
 
 #include "object/s3/utils.h"
 #include "object/s3/aws_sdk_init.h"
+#include "common/backend.h"
 #include "common/nixl_log.h"
 
 namespace nixl_obj_rdma {
@@ -184,9 +186,10 @@ struct S3RdmaControlPlane::Impl {
     sendRdmaRequest(Aws::Http::HttpMethod method,
                     const Aws::Http::URI &uri,
                     const char *token,
-                    const std::function<void(Aws::Http::HttpRequest &)> &set_op_headers) const {
-        auto req = Aws::Http::CreateHttpRequest(
-            uri, method, Aws::Utils::Stream::DefaultResponseStreamFactoryMethod);
+                    const std::function<void(Aws::Http::HttpRequest &)> &set_op_headers,
+                    const Aws::IOStreamFactory &body_stream =
+                        Aws::Utils::Stream::DefaultResponseStreamFactoryMethod) const {
+        auto req = Aws::Http::CreateHttpRequest(uri, method, body_stream);
         req->SetHeaderValue("x-amz-content-sha256", unsigned_payload);
         // The token is the RDMA descriptor verbatim; addr/size are its own
         // leading fields, so it is sent as-is (no append).
@@ -269,7 +272,8 @@ S3RdmaControlPlane::S3RdmaControlPlane(const nixl_b_params_t *custom_params) : i
         impl_->session_token = creds.GetSessionToken();
 
         config.connectTimeoutMs = rdma_connect_timeout_secs * 1000;
-        config.requestTimeoutMs = rdma_timeout_secs * 1000;
+        config.requestTimeoutMs = static_cast<long>(nixl::getBackendParamDefaulted(
+            custom_params, "rdma_request_timeout_ms", uint64_t(rdma_timeout_secs * 1000)));
         impl_->http = Aws::Http::CreateHttpClient(config);
 
         valid_ = impl_->http != nullptr && !impl_->access_key.empty() && !impl_->secret_key.empty();
@@ -284,6 +288,7 @@ S3RdmaControlPlane::~S3RdmaControlPlane() = default;
 
 ssize_t
 S3RdmaControlPlane::rdmaPut(S3RdmaClientCtx &ctx, const char *token, uint64_t size) {
+    ctx.answered = false;
     // A 0-byte PUT would mint a 0-length RDMA region and move no data; the RDMA
     // path is meaningless for it. Reject up front — a legitimate zero-byte object
     // PUT must go through the ordinary HTTP path in the caller.
@@ -314,6 +319,7 @@ S3RdmaControlPlane::rdmaPut(S3RdmaClientCtx &ctx, const char *token, uint64_t si
         }
 
         const int http_status = static_cast<int>(resp->GetResponseCode());
+        ctx.answered = http_status >= 100;
         const std::string etag =
             resp->HasHeader("etag") ? stripQuotes(resp->GetHeader("etag").c_str()) : "";
         const std::string reply = resp->HasHeader(amz_rdma_reply) ?
@@ -359,7 +365,10 @@ ssize_t
 S3RdmaControlPlane::rdmaGet(S3RdmaClientCtx &ctx,
                             const char *token,
                             uint64_t size,
-                            uint64_t offset) {
+                            uint64_t offset,
+                            void *body_dst) {
+    ctx.httpBody = false;
+    ctx.answered = false;
     // A 0-byte transfer would mint/register a 0-length RDMA region; reject it up
     // front rather than issue a meaningless control-plane request.
     if (size == 0) {
@@ -378,65 +387,63 @@ S3RdmaControlPlane::rdmaGet(S3RdmaClientCtx &ctx,
         const std::string range =
             "bytes=" + std::to_string(offset) + "-" + std::to_string(offset + size - 1);
 
+        // With body_dst, a body (a declined GET) lands in the caller's buffer
+        // with no copy. Without it, the default stream holds any error body.
+        std::shared_ptr<Aws::Utils::Stream::PreallocatedStreamBuf> body_buf;
+        Aws::IOStreamFactory body_stream = Aws::Utils::Stream::DefaultResponseStreamFactoryMethod;
+        if (body_dst != nullptr) {
+            body_buf = std::make_shared<Aws::Utils::Stream::PreallocatedStreamBuf>(
+                static_cast<unsigned char *>(body_dst), size);
+            body_stream = [body_buf]() {
+                return Aws::New<Aws::IOStream>("nixl_obj_rdma", body_buf.get());
+            };
+        }
+
         auto resp = impl_->sendRdmaRequest(
-            Aws::Http::HttpMethod::HTTP_GET, uri, token, [&range](Aws::Http::HttpRequest &req) {
-                req.SetHeaderValue("range", range.c_str());
-            });
+            Aws::Http::HttpMethod::HTTP_GET,
+            uri,
+            token,
+            [&range](Aws::Http::HttpRequest &req) { req.SetHeaderValue("range", range.c_str()); },
+            body_stream);
         if (!resp) {
             NIXL_ERROR << "rdmaGet: MakeRequest returned null for key=" << ctx.object;
             return rdma_error;
         }
 
-        // GET is inherently fail-safe: a non-RDMA server omits x-amz-rdma-reply,
-        // which parseRdmaReply maps to "declined" (caller errors under
-        // accelerated=true).
         const int http_status = static_cast<int>(resp->GetResponseCode());
+        ctx.answered = http_status >= 100;
         const std::string reply = resp->HasHeader(amz_rdma_reply) ?
             std::string(resp->GetHeader(amz_rdma_reply).c_str()) :
             "";
-        const int reply_code = parseRdmaReply(reply);
-        if (reply_code == static_cast<int>(rdma_not_supported)) {
+        const std::string bytes_hdr = resp->HasHeader(amz_rdma_bytes_transferred) ?
+            std::string(resp->GetHeader(amz_rdma_bytes_transferred).c_str()) :
+            "";
+        std::optional<uint64_t> body_bytes;
+        if (body_buf) {
+            const auto pos = resp->GetResponseBody().tellp();
+            body_bytes = pos < 0 ? 0 : static_cast<uint64_t>(pos);
+        }
+
+        // GET is inherently fail-safe: a non-RDMA server omits x-amz-rdma-reply,
+        // which classifyGetReply reads as a decline. Out of band, the status and
+        // the reply must agree (200 with 200, 206 with 206), and the byte count
+        // the server reports is authoritative.
+        const getReplyClass result =
+            classifyGetReply(http_status, reply, bytes_hdr, size, body_bytes);
+        switch (result.outcome) {
+        case get_outcome::rdma:
+        case get_outcome::http_body:
+            ctx.httpBody = result.outcome == get_outcome::http_body;
+            ctx.etag = resp->HasHeader("etag") ? stripQuotes(resp->GetHeader("etag").c_str()) : "";
+            return static_cast<ssize_t>(result.bytes);
+        case get_outcome::declined:
             return rdma_not_supported;
+        case get_outcome::error:
+            break;
         }
-        // The HTTP status and the RDMA reply must agree before we trust the
-        // transfer: 200 pairs with a full-object success, 206 with a ranged
-        // partial. A mismatch (e.g. an error status carrying a stale reply) is a
-        // failure.
-        const bool accepted = (http_status == 200 && reply_code == rdma_reply_success) ||
-            (http_status == 206 && reply_code == rdma_reply_partial_content);
-        if (!accepted) {
-            NIXL_ERROR << "rdmaGet failed: http=" << http_status << " x-amz-rdma-reply='" << reply
-                       << "' reply_code=" << reply_code << " key=" << ctx.object;
-            return rdma_error;
-        }
-
-        const std::string etag =
-            resp->HasHeader("etag") ? stripQuotes(resp->GetHeader("etag").c_str()) : "";
-
-        // The server reports the actual transferred byte count in
-        // x-amz-rdma-bytes-transferred: it is authoritative and already clamped
-        // to the servable object/range length, so it can be < requested for a
-        // ranged/partial GET or an oversized buffer. The header is present iff
-        // that count is > 0, so its absence on an accepted 200/206 means a
-        // zero-byte transfer (an empty object or range) — report 0, not the
-        // requested size. Publish ctx.etag only once the response is fully
-        // accepted, so a malformed byte count doesn't leave a stale ETag.
-        ssize_t transferred = 0;
-        if (resp->HasHeader(amz_rdma_bytes_transferred)) {
-            const std::string hdr = resp->GetHeader(amz_rdma_bytes_transferred).c_str();
-            uint64_t n = 0;
-            const char *begin = hdr.data();
-            const char *end = begin + hdr.size();
-            auto [parsed_end, ec] = std::from_chars(begin, end, n);
-            if (ec != std::errc{} || parsed_end != end || n > size) {
-                NIXL_ERROR << "rdmaGet: invalid x-amz-rdma-bytes-transferred='" << hdr
-                           << "' (requested " << size << ") for key=" << ctx.object;
-                return rdma_error;
-            }
-            transferred = static_cast<ssize_t>(n);
-        }
-        ctx.etag = etag;
-        return transferred;
+        NIXL_ERROR << "rdmaGet failed: http=" << http_status << " x-amz-rdma-reply='" << reply
+                   << "' x-amz-rdma-bytes-transferred='" << bytes_hdr << "' key=" << ctx.object;
+        return rdma_error;
     }
     catch (const std::exception &e) {
         NIXL_ERROR << "rdmaGet failed: " << e.what();

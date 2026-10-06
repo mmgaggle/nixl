@@ -16,7 +16,8 @@
 namespace {
 
 // Registered-memory metadata for the accel engine. It records what to clean up
-// on deregister: an OBJ_SEG key mapping, or a DRAM/VRAM buffer pinned for RDMA.
+// on deregister: an OBJ_SEG key mapping, or a DRAM/VRAM buffer registered with
+// the token provider, which it keeps alive until then.
 class accelObjMetadata : public nixlBackendMD {
 public:
     accelObjMetadata(nixl_mem_t nixl_mem, uint64_t dev_id, std::string obj_key)
@@ -25,11 +26,13 @@ public:
           devId(dev_id),
           objKey(std::move(obj_key)) {}
 
-    accelObjMetadata(nixl_mem_t nixl_mem, uintptr_t addr)
+    accelObjMetadata(nixl_mem_t nixl_mem,
+                     uintptr_t addr,
+                     std::shared_ptr<nixl_obj_rdma::iRdmaTokenProvider> tokens)
         : nixlBackendMD(true),
           nixlMem(nixl_mem),
           localAddr(addr),
-          rdmaRegistered(true) {}
+          rdmaTokens(std::move(tokens)) {}
 
     ~accelObjMetadata() = default;
 
@@ -37,7 +40,7 @@ public:
     uint64_t devId = 0;
     std::string objKey;
     uintptr_t localAddr = 0;
-    bool rdmaRegistered = false;
+    std::shared_ptr<nixl_obj_rdma::iRdmaTokenProvider> rdmaTokens;
 };
 
 // Register the standard-S3 engine under "s3"; obj_backend normalizes a missing
@@ -71,17 +74,27 @@ S3AccelObjEngineImpl::getClient() const {
     return s3Client_.get();
 }
 
+std::shared_ptr<nixl_obj_rdma::iRdmaTokenProvider>
+S3AccelObjEngineImpl::rdmaTokens() const {
+    const auto *client = dynamic_cast<const awsS3AccelClient *>(s3Client_.get());
+    if (client == nullptr || !client->supportsRdma()) {
+        return nullptr;
+    }
+    return client->tokenProvider();
+}
+
 bool
 S3AccelObjEngineImpl::rdmaEngReady() const {
-    const auto *client = dynamic_cast<const awsS3AccelClient *>(s3Client_.get());
-    return client != nullptr && client->supportsRdma();
+    return rdmaTokens() != nullptr;
 }
 
 nixl_mem_list_t
 S3AccelObjEngineImpl::getSupportedMems() const {
-    // VRAM_SEG (GPU-direct) is advertised only when the RDMA fast path is ready,
-    // so a GPU pointer can never reach the HTTP path.
-    if (rdmaEngReady()) {
+    // VRAM_SEG (GPU-direct) is advertised only when the RDMA fast path is ready
+    // and its token provider can register GPU memory, so a GPU pointer can
+    // never reach the HTTP path.
+    const auto tokens = rdmaTokens();
+    if (tokens && tokens->supportsMem(VRAM_SEG)) {
         return {DRAM_SEG, OBJ_SEG, VRAM_SEG};
     }
     return {DRAM_SEG, OBJ_SEG};
@@ -104,18 +117,19 @@ S3AccelObjEngineImpl::registerMem(const nixlBlobDesc &mem,
         return NIXL_SUCCESS;
     }
 
-    // DRAM_SEG / VRAM_SEG: pin the buffer so the client can mint a cuObject token
-    // for it. The accelerated path is RDMA-only (no HTTP fallback), so when the
-    // fast path is ready a registration failure is a hard error rather than a
-    // silent success that fails later at transfer time.
-    if (rdmaEngReady()) {
-        auto *rdma = nixl_obj_rdma::SharedCuObjClient::instance();
-        if (!rdma || !rdma->registerBuffer(reinterpret_cast<void *>(mem.addr), mem.len)) {
-            NIXL_ERROR << "RDMA buffer registration failed; the accelerated path has no HTTP "
-                          "fallback";
-            return NIXL_ERR_BACKEND;
+    // DRAM_SEG / VRAM_SEG: register the buffer with the token provider so the
+    // client can mint tokens for it. The accelerated path is RDMA-only, so when
+    // the fast path is ready a registration failure is a hard error rather than
+    // a silent success that fails later at transfer time.
+    if (auto tokens = rdmaTokens()) {
+        const nixl_status_t status = tokens->registerMemory(
+            reinterpret_cast<void *>(mem.addr), mem.len, nixl_mem, mem.devId);
+        if (status != NIXL_SUCCESS) {
+            NIXL_ERROR << "RDMA buffer registration (" << tokens->name()
+                       << ") failed; the accelerated path has no HTTP fallback";
+            return status;
         }
-        out = std::make_unique<accelObjMetadata>(nixl_mem, mem.addr).release();
+        out = std::make_unique<accelObjMetadata>(nixl_mem, mem.addr, std::move(tokens)).release();
         return NIXL_SUCCESS;
     }
 
@@ -132,10 +146,8 @@ S3AccelObjEngineImpl::deregisterMem(nixlBackendMD *meta) {
         std::unique_ptr<accelObjMetadata> obj_md_ptr(obj_md);
         if (obj_md->nixlMem == OBJ_SEG) {
             devIdToObjKey_.erase(obj_md->devId);
-        } else if (obj_md->rdmaRegistered) {
-            if (auto *rdma = nixl_obj_rdma::SharedCuObjClient::instance()) {
-                rdma->deregisterBuffer(reinterpret_cast<void *>(obj_md->localAddr));
-            }
+        } else if (obj_md->rdmaTokens) {
+            obj_md->rdmaTokens->deregisterMemory(reinterpret_cast<void *>(obj_md->localAddr));
         }
     }
     return NIXL_SUCCESS;

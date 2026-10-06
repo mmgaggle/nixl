@@ -72,4 +72,49 @@ TEST(RdmaProtocol, ProtocolConstantsHaveExpectedValues) {
     EXPECT_EQ(rdma_error, -1);
 }
 
+// The GET outcome, row by row: status, reply, byte count, requested, body kept.
+TEST(RdmaProtocol, ClassifyGetReply) {
+    struct row {
+        int status;
+        const char *reply;
+        const char *bytes;
+        uint64_t requested;
+        std::optional<uint64_t> body;
+        get_outcome outcome;
+        uint64_t delivered;
+    };
+
+    const row rows[] = {
+        // out of band: the status and the reply agree
+        {200, "200", "4096", 4096, std::nullopt, get_outcome::rdma, 4096},
+        {206, "206", "100", 100, std::nullopt, get_outcome::rdma, 100},
+        {206, "206", "", 100, std::nullopt, get_outcome::rdma, 0}, // an empty range
+        {206, "206", "80", 100, std::nullopt, get_outcome::rdma, 80}, // clamped by the server
+        // they disagree: Ceph before it answered a range with 206
+        {206, "200", "100", 100, std::nullopt, get_outcome::error, 0},
+        {200, "206", "100", 100, std::nullopt, get_outcome::error, 0},
+        // a byte count that is malformed or larger than the request
+        {200, "200", "4097", 4096, std::nullopt, get_outcome::error, 0},
+        {200, "200", "12x", 4096, std::nullopt, get_outcome::error, 0},
+        // a decline, without and with the body kept
+        {206, "501", "", 100, std::nullopt, get_outcome::declined, 0},
+        {206, "", "", 100, std::nullopt, get_outcome::declined, 0}, // a server without RDMA
+        {206, "501", "", 100, 100, get_outcome::http_body, 100},
+        {200, "", "", 100, 64, get_outcome::http_body, 64},
+        // an error status is an error, whatever the reply says
+        {403, "", "", 100, 100, get_outcome::error, 0},
+        {500, "501", "", 100, std::nullopt, get_outcome::error, 0},
+        {404, "200", "100", 100, std::nullopt, get_outcome::error, 0},
+        // a malformed reply
+        {200, "2OO", "100", 100, std::nullopt, get_outcome::error, 0},
+    };
+    for (const row &r : rows) {
+        const getReplyClass c = classifyGetReply(r.status, r.reply, r.bytes, r.requested, r.body);
+        EXPECT_EQ(c.outcome, r.outcome)
+            << r.status << " / '" << r.reply << "' / '" << r.bytes << "'";
+        EXPECT_EQ(c.bytes, r.delivered)
+            << r.status << " / '" << r.reply << "' / '" << r.bytes << "'";
+    }
+}
+
 } // namespace
