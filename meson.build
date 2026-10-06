@@ -475,6 +475,16 @@ else
   libfabric_dep = dependency('libfabric', required: false)
 endif
 
+# ofi-rma: libfabric windows and ofi1 tokens, for the OBJ plugin's
+# S3-over-RDMA data path against Ceph RGW. An installed ofi-rma, or the
+# subproject from subprojects/ofi-rma.wrap, built static for the plugin.
+ofi_rma_dep = dependency('ofi-rma', version: '>=0.1.0',
+    required: get_option('ofi_rma'), allow_fallback: true,
+    default_options: ['default_library=static', 'tests=disabled', 'hip=disabled'])
+if ofi_rma_dep.found()
+    add_project_arguments('-DHAVE_OFI_RMA', language: ['cpp'])
+endif
+
 # UCX GPU device API detection
 nvcc_prog = find_program('nvcc', required: false)
 ucx_gpu_device_api_available = false
