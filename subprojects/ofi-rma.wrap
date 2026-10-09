@@ -1,6 +1,6 @@
 [wrap-git]
 url = https://github.com/mmgaggle/ofi-rma.git
-revision = 3f0083edb6edcd47940f0c522678495514f45a85
+revision = 609a0c210af0dae63ff27539e1653d0d2a9c7fec
 
 [provide]
 dependency_names = ofi-rma

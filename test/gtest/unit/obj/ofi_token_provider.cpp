@@ -23,7 +23,7 @@
 #include <string>
 #include <vector>
 
-#include <ofi_rma/ofi_rma.h>
+#include <ofi_rma/ofi_rma.hpp>
 
 #include "object/rdma/ofi_token_provider.h"
 
@@ -158,7 +158,7 @@ TEST_P(ofiTokenProviderTest, WriterFillsADramBuffer) {
     const auto parsed = ofi_rma::parse_token(token->value());
     ASSERT_TRUE(parsed);
     EXPECT_EQ(n, parsed->size);
-    EXPECT_EQ(writer_->provider(), parsed->provider);
+    EXPECT_EQ(writer_->wire(), parsed->wire);
 
     const auto src = pattern(n, 3);
     ASSERT_EQ(0, writeAll(*writer_, token->value(), src)) << writer_->last_error();

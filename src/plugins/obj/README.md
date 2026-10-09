@@ -230,7 +230,7 @@ This configuration automatically uses the high-performance S3 CRT client for obj
 
 #### S3 over RDMA with libfabric (Ceph RGW)
 
-Ceph RGW with OSD passthrough (`rgw_rdma_osd_passthrough`) forwards the `ofi1` token of a GET to its OSDs, and each OSD writes its stripes straight into the client's buffer. The OSDs and the client must run the same libfabric provider:
+Ceph RGW with OSD passthrough (`rgw_rdma_osd_passthrough`) forwards the `ofi1` token of a GET to its OSDs, and each OSD writes its stripes straight into the client's buffer. The OSDs and the client must speak the same wire protocol, which the token names, for example `rxm.1` for `verbs;ofi_rxm`. Two vendors' UET providers speak the same protocol:
 
 ```cpp
 nixl_b_params_t params = {

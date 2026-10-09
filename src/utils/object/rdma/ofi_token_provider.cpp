@@ -12,7 +12,7 @@
 #include <dlfcn.h>
 #include <unistd.h>
 
-#include <ofi_rma/ofi_rma.h>
+#include <ofi_rma/ofi_rma.hpp>
 
 #include "common/backend.h"
 #include "common/nixl_log.h"
